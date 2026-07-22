@@ -1,0 +1,18 @@
+"$schema" = "schemas/schema.json"
+
+[default]
+description = """Default permissions for the Apple Intelligence plugin: availability checks,
+generation, streaming (incl. cancel), and capability queries (context window, token counting,
+supported languages, prewarm). All commands talk only to the local FoundationModels framework —
+nothing leaves the device except Private Cloud Compute requests, which are private-by-design."""
+permissions = [
+	"allow-check-availability",
+	"allow-pcc-check-availability",
+	"allow-generate",
+	"allow-stream",
+	"allow-cancel-stream",
+	"allow-context-info",
+	"allow-token-count",
+	"allow-supported-languages",
+	"allow-prewarm",
+]

@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-pcc-check-availability"
+description = "Enables the pcc_check_availability command without any pre-configured scope."
+commands.allow = ["pcc_check_availability"]
+
+[[permission]]
+identifier = "deny-pcc-check-availability"
+description = "Denies the pcc_check_availability command without any pre-configured scope."
+commands.deny = ["pcc_check_availability"]

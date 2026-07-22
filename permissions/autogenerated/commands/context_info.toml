@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-context-info"
+description = "Enables the context_info command without any pre-configured scope."
+commands.allow = ["context_info"]
+
+[[permission]]
+identifier = "deny-context-info"
+description = "Denies the context_info command without any pre-configured scope."
+commands.deny = ["context_info"]

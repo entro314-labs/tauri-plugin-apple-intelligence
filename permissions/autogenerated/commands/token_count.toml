@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-token-count"
+description = "Enables the token_count command without any pre-configured scope."
+commands.allow = ["token_count"]
+
+[[permission]]
+identifier = "deny-token-count"
+description = "Denies the token_count command without any pre-configured scope."
+commands.deny = ["token_count"]

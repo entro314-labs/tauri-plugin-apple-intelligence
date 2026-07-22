@@ -1,0 +1,245 @@
+// End-to-end smoke test: the built provider driven by the real `ai` v7 core functions.
+import assert from "node:assert/strict";
+import { generateText, streamText, generateObject, streamObject, jsonSchema } from "ai";
+import {
+  createAppleIntelligenceProvider,
+  AppleIntelligenceGenerationError,
+} from "../dist-js/index.mjs";
+
+const calls = { generate: [], stream: [] };
+
+function makeTransport(overrides = {}) {
+  return {
+    async checkAvailability() {
+      return { available: true, reason: "ok" };
+    },
+    async generate(options) {
+      calls.generate.push(options);
+      if (overrides.generateError) throw overrides.generateError;
+      if (options.schema) {
+        return {
+          text: "",
+          object: { city: "Athens", rating: 9 },
+          usage: { inputTokens: 40, cachedInputTokens: 10, outputTokens: 12, reasoningTokens: 0 },
+        };
+      }
+      return {
+        text: "Hello from Apple Intelligence",
+        usage: { inputTokens: 20, cachedInputTokens: 0, outputTokens: 6, reasoningTokens: 2 },
+      };
+    },
+    async *stream(options) {
+      calls.stream.push(options);
+      if (overrides.streamEvents) {
+        yield* overrides.streamEvents;
+        return;
+      }
+      yield { type: "text", text: "Hello " };
+      yield { type: "text", text: "world" };
+      yield {
+        type: "usage",
+        usage: { inputTokens: 15, cachedInputTokens: 5, outputTokens: 4, reasoningTokens: 0 },
+      };
+      yield { type: "done" };
+    },
+  };
+}
+
+// 1. generateText: per-call sampling params + portable reasoning reach the transport.
+{
+  const provider = createAppleIntelligenceProvider({ transport: makeTransport() });
+  const result = await generateText({
+    model: provider("apple-private-cloud"),
+    prompt: "Say hello",
+    temperature: 0,
+    topP: 0.9,
+    seed: 42,
+    reasoning: "high",
+  });
+  assert.equal(result.text, "Hello from Apple Intelligence");
+  const request = calls.generate.at(-1);
+  assert.equal(request.temperature, 0, "temperature 0 must pass through");
+  assert.equal(request.topP, 0.9);
+  assert.equal(request.seed, 42);
+  assert.equal(request.model, "private-cloud");
+  assert.equal(request.reasoningLevel, "deep", "reasoning high → deep");
+  assert.equal(result.usage.inputTokens, 20);
+  assert.equal(result.usage.outputTokenDetails.reasoningTokens, 2);
+  console.log("1 generateText: params + reasoning + usage OK");
+}
+
+// 2. streamText: text deltas + usage.
+{
+  const provider = createAppleIntelligenceProvider({ transport: makeTransport() });
+  const result = streamText({ model: provider("apple-on-device"), prompt: "Say hello" });
+  let text = "";
+  for await (const delta of result.textStream) text += delta;
+  assert.equal(text, "Hello world");
+  const usage = await result.usage;
+  assert.equal(usage.inputTokens, 15);
+  console.log("2 streamText: deltas + usage OK");
+}
+
+// 3. generateObject: schema reaches the transport; object round-trips.
+{
+  const provider = createAppleIntelligenceProvider({ transport: makeTransport() });
+  const { object } = await generateObject({
+    model: provider("apple-on-device"),
+    schema: jsonSchema({
+      type: "object",
+      properties: { city: { type: "string" }, rating: { type: "number" } },
+      required: ["city", "rating"],
+      additionalProperties: false,
+    }),
+    prompt: "Rate Athens",
+    output: "object",
+    mode: "json",
+  });
+  assert.equal(object.city, "Athens");
+  assert.ok(calls.generate.at(-1).schema, "schema must reach the transport");
+  console.log("3 generateObject: guided generation OK");
+}
+
+// 4. streamObject: simulated structured stream produces the full object.
+{
+  const provider = createAppleIntelligenceProvider({ transport: makeTransport() });
+  const result = streamObject({
+    model: provider("apple-on-device"),
+    schema: jsonSchema({
+      type: "object",
+      properties: { city: { type: "string" }, rating: { type: "number" } },
+      required: ["city", "rating"],
+      additionalProperties: false,
+    }),
+    prompt: "Rate Athens",
+  });
+  for await (const _partial of result.partialObjectStream) {
+    // drain — promises resolve on consumption
+  }
+  const object = await result.object;
+  assert.equal(object.rating, 9);
+  console.log("4 streamObject: simulated structured stream OK");
+}
+
+// 5. Guardrail violation → content-filter finish reason (no throw).
+{
+  const provider = createAppleIntelligenceProvider({
+    transport: makeTransport({
+      generateError: new AppleIntelligenceGenerationError({
+        code: "guardrail-violation",
+        message: "blocked by safety guardrails",
+      }),
+    }),
+  });
+  const result = await generateText({ model: provider("apple-on-device"), prompt: "hi" });
+  assert.equal(result.finishReason.unified ?? result.finishReason, "content-filter");
+  console.log("5 guardrail violation → content-filter finish OK");
+}
+
+// 6. Context window exceeded → typed error propagates with code + sizes.
+{
+  const provider = createAppleIntelligenceProvider({
+    transport: makeTransport({
+      generateError: new AppleIntelligenceGenerationError({
+        code: "context-window-exceeded",
+        message: "prompt too large",
+        contextSize: 4096,
+        tokenCount: 5000,
+      }),
+    }),
+  });
+  await assert.rejects(
+    generateText({ model: provider("apple-on-device"), prompt: "hi" }),
+    (error) => {
+      const cause = error instanceof AppleIntelligenceGenerationError ? error : error.cause;
+      assert.ok(cause instanceof AppleIntelligenceGenerationError, `typed error, got ${error}`);
+      assert.equal(cause.code, "context-window-exceeded");
+      assert.equal(cause.contextSize, 4096);
+      return true;
+    }
+  );
+  console.log("6 context-window-exceeded → typed error OK");
+}
+
+// 7. Stream error with guardrail code → content-filter finish, stream completes cleanly.
+{
+  const provider = createAppleIntelligenceProvider({
+    transport: makeTransport({
+      streamEvents: [
+        { type: "text", text: "partial" },
+        { type: "error", code: "refusal", message: "the model refused" },
+      ],
+    }),
+  });
+  const result = streamText({ model: provider("apple-on-device"), prompt: "hi" });
+  let text = "";
+  for await (const delta of result.textStream) text += delta;
+  assert.equal(text, "partial");
+  const finish = await result.finishReason;
+  assert.equal(finish.unified ?? finish, "content-filter");
+  console.log("7 stream refusal → content-filter finish OK");
+}
+
+// 8. toolChoice none drops tools; >5 tools warns.
+{
+  const provider = createAppleIntelligenceProvider({ transport: makeTransport() });
+  const tools = Object.fromEntries(
+    Array.from({ length: 6 }, (_, i) => [
+      `tool${i}`,
+      {
+        description: `tool ${i}`,
+        inputSchema: jsonSchema({
+          type: "object",
+          properties: {},
+          additionalProperties: false,
+        }),
+      },
+    ])
+  );
+  const result = await generateText({
+    model: provider("apple-on-device"),
+    prompt: "hi",
+    tools,
+    toolChoice: "none",
+  });
+  assert.equal(calls.generate.at(-1).tools, undefined, "toolChoice none must drop tools");
+  const withWarnings = await generateText({
+    model: provider("apple-on-device"),
+    prompt: "hi",
+    tools,
+  });
+  const warningMessages = JSON.stringify(withWarnings.warnings ?? []);
+  assert.ok(warningMessages.includes("3-5 tools"), `tool-count warning expected, got ${warningMessages}`);
+  assert.equal(calls.generate.at(-1).toolChoice, "auto");
+  console.log("8 toolChoice + tool-count warning OK");
+}
+
+// 9. toAppleIntelligenceError: host command-error envelopes ({type:'System', data}) and unknown
+// object payloads must never degrade to "[object Object]", and a stringified plugin
+// `[code] message` Display is recovered as a typed generation error.
+{
+  const { toAppleIntelligenceError } = await import("../dist-js/index.mjs");
+
+  const typed = toAppleIntelligenceError({
+    type: "System",
+    data: "[assets-unavailable] The operation couldn’t be completed.",
+  });
+  assert.ok(typed instanceof AppleIntelligenceGenerationError, "envelope with [code] prefix must be typed");
+  assert.equal(typed.code, "assets-unavailable");
+  assert.equal(typed.message, "The operation couldn’t be completed.");
+
+  const plain = toAppleIntelligenceError({ type: "System", data: "dylib exploded" });
+  assert.equal(plain.message, "dylib exploded");
+  assert.ok(!(plain instanceof AppleIntelligenceGenerationError));
+
+  const stringReason = toAppleIntelligenceError("[stream-busy] a stream is already active");
+  assert.ok(stringReason instanceof AppleIntelligenceGenerationError);
+  assert.equal(stringReason.code, "stream-busy");
+
+  const unknownShape = toAppleIntelligenceError({ weird: true, nested: { n: 1 } });
+  assert.ok(!unknownShape.message.includes("[object Object]"), "must not stringify to [object Object]");
+  assert.ok(unknownShape.message.includes('"weird":true'), "unknown shapes are JSON-stringified");
+  console.log("9 toAppleIntelligenceError normalization OK");
+}
+
+console.log("\nAll smoke tests passed.");

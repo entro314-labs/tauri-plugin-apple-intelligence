@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-prewarm"
+description = "Enables the prewarm command without any pre-configured scope."
+commands.allow = ["prewarm"]
+
+[[permission]]
+identifier = "deny-prewarm"
+description = "Denies the prewarm command without any pre-configured scope."
+commands.deny = ["prewarm"]

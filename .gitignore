@@ -1,0 +1,29 @@
+# Rust
+target
+
+# JS
+node_modules
+dist-js
+*.tsbuildinfo
+coverage
+
+# Logs
+logs
+*.log
+npm-debug.log*
+pnpm-debug.log*
+
+# Env
+.env
+.env.local
+
+# OS / editors
+.DS_Store
+.idea
+*.suo
+*.sw?
+
+# Signing keys - NEVER COMMIT THESE
+SIGNING_KEY.md
+*.key
+*.pem
