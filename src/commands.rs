@@ -52,10 +52,7 @@ pub(crate) async fn context_info(
 }
 
 #[command]
-pub(crate) async fn token_count(
-    model: Option<String>,
-    text: String,
-) -> Result<i64, AppleAIError> {
+pub(crate) async fn token_count(model: Option<String>, text: String) -> Result<i64, AppleAIError> {
     native::token_count(model, text)
 }
 
