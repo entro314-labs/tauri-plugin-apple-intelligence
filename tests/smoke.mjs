@@ -270,4 +270,42 @@ function makeTransport(overrides = {}) {
   console.log("10 private-cloud availability is checked per model OK");
 }
 
+// 11. A schema the native converter cannot express (open maps, heterogeneous tuples, boolean
+// literals) is refused with `unsupported-guide` rather than answered with plausible wrong data.
+// The refusal must reach the caller as a typed error it can branch on to fall back — not as a
+// content-filter finish, and not flattened into a generic AI SDK error.
+{
+  const provider = createAppleIntelligenceProvider({
+    transport: makeTransport({
+      generateError: new AppleIntelligenceGenerationError({
+        code: "unsupported-guide",
+        message:
+          'The schema for "labels" is an open map (object with \'additionalProperties\' and no ' +
+          "declared 'properties'), which Apple's guided generation cannot express",
+      }),
+    }),
+  });
+  await assert.rejects(
+    generateObject({
+      model: provider("apple-on-device"),
+      schema: jsonSchema({
+        type: "object",
+        properties: { labels: { type: "object", additionalProperties: { type: "string" } } },
+        required: ["labels"],
+      }),
+      prompt: "Label this ticket",
+      output: "object",
+      mode: "json",
+    }),
+    (error) => {
+      const cause = error instanceof AppleIntelligenceGenerationError ? error : error.cause;
+      assert.ok(cause instanceof AppleIntelligenceGenerationError, `typed error, got ${error}`);
+      assert.equal(cause.code, "unsupported-guide");
+      assert.match(cause.message, /open map/);
+      return true;
+    }
+  );
+  console.log("11 unsupported-guide refusal → typed error the caller can fall back from OK");
+}
+
 console.log("\nAll smoke tests passed.");

@@ -364,6 +364,52 @@ fn array_form_nullability_is_honored() {
     );
 }
 
+/// OpenAPI 3.0 spells nullability `nullable: true` rather than a `null` union member, and schemas
+/// converted from an OpenAPI document carry that spelling. It was not read at all, so the field
+/// became a plain non-nullable value — the same silent failure as the dropped `null` member: the
+/// model cannot answer "nothing here", invents a value, and the caller's validator accepts it.
+#[test]
+#[ignore = "requires the on-device Apple Intelligence model — run locally with --ignored"]
+fn openapi_nullable_flag_is_honored() {
+    let app = mock_app();
+    let handle = app.handle().clone();
+    if !model_ready(&handle) {
+        return;
+    }
+
+    let request = user_request(
+        "Extract the crossing from this note. The note gives no delay at all: \
+         \"Piraeus to Chania, departed on time.\"",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "route": {"type": "string"},
+                "delayMinutes": {
+                    "type": "integer",
+                    "nullable": true,
+                    "description": "Minutes late, or null when the note reports no delay.",
+                },
+            },
+            "required": ["route", "delayMinutes"],
+        }),
+    );
+
+    let Some(result) = generate_or_skip(&app, request) else {
+        return;
+    };
+    let object = result.object.expect("structured result carries an object");
+    eprintln!("openapi nullable probe: {object}");
+
+    assert!(
+        object.get("route").and_then(|value| value.as_str()).is_some_and(|s| !s.is_empty()),
+        "the sibling field must still be filled: {object}"
+    );
+    assert!(
+        object.get("delayMinutes").is_none_or(serde_json::Value::is_null),
+        "an OpenAPI-nullable field with nothing to report must come back null (or absent): {object}"
+    );
+}
+
 /// The other shapes the converter used to answer with a silently coerced `String`. Each must now
 /// come back as a typed `unsupported-guide` refusal: a caller that gets one can fall back, whereas
 /// a caller handed a plausible-looking wrong object cannot tell anything went wrong.
@@ -399,6 +445,358 @@ fn unexpressible_schema_shapes_are_refused_with_typed_errors() {
             .apple_intelligence()
             .generate(request)
             .expect_err("an unexpressible schema must be refused")
+            .to_string();
+        assert!(
+            message.contains("unsupported-guide"),
+            "expected a typed unsupported-guide refusal for {label}, got: {message}"
+        );
+        eprintln!("{label} refusal: {message}");
+    }
+}
+
+/// An open map (`z.record(...)` → `{"type":"object","additionalProperties":{…}}` with no
+/// `properties`) has no counterpart in guided generation: `DynamicGenerationSchema` can only build a
+/// *closed* object out of a fixed property list. The converter used to build that object with zero
+/// properties, and the guide handed to the model was literally
+/// `{"type":"object","properties":{},"additionalProperties":false}` — so the model could only ever
+/// answer `{}`. `z.record()` then *accepted* the `{}`, and nothing anywhere reported an error.
+///
+/// The same shape also arrives spelled `patternProperties` (draft-07) and `propertyNames`
+/// (what zod emits alongside `additionalProperties`). Every spelling must be refused.
+#[test]
+#[ignore = "requires macOS with FoundationModels — run locally with --ignored"]
+fn open_map_schemas_are_refused_with_typed_errors() {
+    let app = mock_app();
+
+    let cases = [
+        (
+            "additionalProperties",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "labels": {
+                        "type": "object",
+                        "propertyNames": {"type": "string"},
+                        "additionalProperties": {"type": "string"},
+                    },
+                },
+                "required": ["labels"],
+            }),
+        ),
+        (
+            "patternProperties",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "labels": {
+                        "type": "object",
+                        "patternProperties": {"^.*$": {"type": "string"}},
+                    },
+                },
+                "required": ["labels"],
+            }),
+        ),
+        (
+            "root-level record",
+            serde_json::json!({
+                "type": "object",
+                "additionalProperties": {"type": "number"},
+            }),
+        ),
+    ];
+
+    for (label, schema) in cases {
+        let message = app
+            .apple_intelligence()
+            .generate(user_request("List two labels for a ferry ticket.", schema))
+            .expect_err("an open map must be refused, not answered with an empty object")
+            .to_string();
+        assert!(
+            message.contains("unsupported-guide"),
+            "expected a typed unsupported-guide refusal for {label}, got: {message}"
+        );
+        assert!(
+            message.contains("labels") || label == "root-level record",
+            "the refusal must name the offending property for {label}, got: {message}"
+        );
+        eprintln!("{label} refusal: {message}");
+    }
+}
+
+/// The permissive half of the open-map story. `additionalProperties: false` beside real
+/// `properties` is the ordinary closed object every `z.object()` emits and must keep working, and
+/// `additionalProperties: {}`/`true` (`z.looseObject()`) *permits* extra keys without requiring
+/// any — so dropping the open part and generating the declared properties is a narrowing nothing
+/// downstream can reject. Neither may be refused.
+#[test]
+#[ignore = "requires the on-device Apple Intelligence model — run locally with --ignored"]
+fn objects_with_declared_properties_ignore_the_open_part() {
+    let app = mock_app();
+    let handle = app.handle().clone();
+    if !model_ready(&handle) {
+        return;
+    }
+
+    for (label, additional) in
+        [("closed", serde_json::json!(false)), ("open", serde_json::json!({}))]
+    {
+        let request = user_request(
+            "The ferry Blue Star leaves from Piraeus. Extract the ship and its port.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "ship": {"type": "string"},
+                    "port": {"type": "string"},
+                },
+                "required": ["ship", "port"],
+                "additionalProperties": additional,
+            }),
+        );
+        let Some(result) = generate_or_skip(&app, request) else {
+            return;
+        };
+        let object = result.object.expect("structured result carries an object");
+        eprintln!("{label} object probe: {object}");
+        for key in ["ship", "port"] {
+            assert!(
+                object.get(key).and_then(|value| value.as_str()).is_some_and(|s| !s.is_empty()),
+                "'{key}' must be filled for the {label} object: {object}"
+            );
+        }
+    }
+}
+
+/// Draft-07 spells a tuple `{"items": [...]}` (an array, not an object) and 2020-12 spells it
+/// `{"prefixItems": [...]}`. The converter read `items as? [String: Any]`, missed both, and fell
+/// back to an unbounded array of *strings*: `z.tuple([z.string(), z.number()])` came back as
+/// `["Piraeus", "1834"]`, with the number stringified and the arity gone.
+///
+/// A fixed-length heterogeneous array has no counterpart in guided generation — `arrayOf:` takes a
+/// single item schema, so position-dependent types cannot be expressed — and coercing one into
+/// `array of (string | number)` would discard the positional contract silently. Refused instead.
+#[test]
+#[ignore = "requires macOS with FoundationModels — run locally with --ignored"]
+fn heterogeneous_tuple_schemas_are_refused_with_typed_errors() {
+    let app = mock_app();
+
+    let cases = [
+        (
+            "draft-07 items array",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "berth": {"type": "array", "items": [{"type": "string"}, {"type": "number"}]},
+                },
+                "required": ["berth"],
+            }),
+        ),
+        (
+            "2020-12 prefixItems",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "berth": {
+                        "type": "array",
+                        "prefixItems": [{"type": "string"}, {"type": "number"}],
+                    },
+                },
+                "required": ["berth"],
+            }),
+        ),
+        (
+            "homogeneous prefix with an open rest",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "berth": {
+                        "type": "array",
+                        "prefixItems": [{"type": "string"}],
+                        "items": {"type": "number"},
+                    },
+                },
+                "required": ["berth"],
+            }),
+        ),
+    ];
+
+    for (label, schema) in cases {
+        let message = app
+            .apple_intelligence()
+            .generate(user_request("Give the berth name and its number.", schema))
+            .expect_err("a heterogeneous tuple must be refused, not flattened to strings")
+            .to_string();
+        assert!(
+            message.contains("unsupported-guide"),
+            "expected a typed unsupported-guide refusal for {label}, got: {message}"
+        );
+        assert!(
+            message.contains("berth"),
+            "the refusal must name the offending property for {label}, got: {message}"
+        );
+        eprintln!("{label} refusal: {message}");
+    }
+}
+
+/// A tuple whose members are all the same shape *is* expressible — it is exactly a fixed-length
+/// array — so it is converted rather than refused. Previously the tuple spelling was missed
+/// entirely and the guide became an *unbounded* array of strings, so the arity was never stated.
+///
+/// The prompt deliberately names fewer stops than the tuple declares: an unbounded guide lets the
+/// model answer with as many as it feels like (which is how the arity loss stayed invisible),
+/// while a fixed-length one forces exactly the declared count.
+#[test]
+#[ignore = "requires the on-device Apple Intelligence model — run locally with --ignored"]
+fn homogeneous_tuple_becomes_a_fixed_length_array() {
+    let app = mock_app();
+    let handle = app.handle().clone();
+    if !model_ready(&handle) {
+        return;
+    }
+
+    let request = user_request(
+        "The ferry sails Piraeus to Chania. Name its stops.",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "stops": {
+                    "type": "array",
+                    "prefixItems": [
+                        {"type": "string"},
+                        {"type": "string"},
+                        {"type": "string"},
+                    ],
+                },
+            },
+            "required": ["stops"],
+        }),
+    );
+
+    let Some(result) = generate_or_skip(&app, request) else {
+        return;
+    };
+    let object = result.object.expect("structured result carries an object");
+    eprintln!("homogeneous tuple probe: {object}");
+
+    let stops = object.get("stops").and_then(|value| value.as_array()).expect("stops is an array");
+    assert_eq!(stops.len(), 3, "a 3-tuple must come back with exactly three members: {object}");
+    for element in stops {
+        assert!(element.is_string(), "each member keeps the declared type: {object}");
+    }
+}
+
+/// String enums worked; the non-string half was dropped, so `{"type":"integer","enum":[…]}` became
+/// a free integer and `{"type":"number","const":42}` a free number — the model was never told the
+/// constraint. Guided generation has no literal primitive for numbers, but a value can be pinned
+/// exactly with `GenerationGuide.range(v...v)`, and a set of them with an `anyOf` of pins, so these
+/// are now expressed rather than widened. `minimum`/`maximum` ride the same mechanism.
+#[test]
+#[ignore = "requires the on-device Apple Intelligence model — run locally with --ignored"]
+fn non_string_enums_and_numeric_bounds_are_honored() {
+    let app = mock_app();
+    let handle = app.handle().clone();
+    if !model_ready(&handle) {
+        return;
+    }
+
+    let request = user_request(
+        "Rate the Piraeus to Chania ferry crossing.",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "deck": {"type": "integer", "enum": [2, 4, 8]},
+                // zod v4 spells a numeric enum as a union of consts, not as `enum`.
+                "berths": {
+                    "anyOf": [
+                        {"type": "number", "const": 1},
+                        {"type": "number", "const": 2},
+                    ],
+                },
+                "version": {"type": "number", "const": 42},
+                "stars": {"type": "integer", "minimum": 1, "maximum": 5},
+                // A mixed string/number enum is expressible after all: the string members become a
+                // literal group and each number a pinned constant, side by side in one union.
+                "cabin": {"enum": ["deck", 7]},
+                // A literal factored into `$defs`: the dependency has to keep its name, or every
+                // `$ref` at it is left undefined.
+                "lane": {"$ref": "#/$defs/Lane"},
+            },
+            "required": ["deck", "berths", "version", "stars", "cabin", "lane"],
+            "$defs": {"Lane": {"type": "integer", "const": 3}},
+        }),
+    );
+
+    let Some(result) = generate_or_skip(&app, request) else {
+        return;
+    };
+    let object = result.object.expect("structured result carries an object");
+    eprintln!("non-string enum probe: {object}");
+
+    let number = |key: &str| {
+        object
+            .get(key)
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or_else(|| panic!("'{key}' must be a number: {object}"))
+    };
+    assert!(
+        [2.0, 4.0, 8.0].contains(&number("deck")),
+        "an integer enum must constrain the answer: {object}"
+    );
+    assert!(
+        [1.0, 2.0].contains(&number("berths")),
+        "a union of numeric consts must constrain the answer: {object}"
+    );
+    assert_eq!(number("version"), 42.0, "a numeric const must be pinned: {object}");
+    let stars = number("stars");
+    assert!((1.0..=5.0).contains(&stars), "numeric bounds must be honored: {object}");
+
+    let cabin = object.get("cabin").expect("cabin is present");
+    assert!(
+        cabin.as_str() == Some("deck") || cabin.as_f64() == Some(7.0),
+        "a mixed string/number enum must constrain the answer to its members: {object}"
+    );
+    assert_eq!(number("lane"), 3.0, "a literal reached through a `$ref` must be pinned: {object}");
+}
+
+/// The non-string constraints that stay unexpressible. A boolean literal cannot be pinned (there is
+/// no boolean guide), and an enum mixing types has no single guide either — both are refused rather
+/// than widened into a free boolean / free value the model was never told anything about.
+#[test]
+#[ignore = "requires macOS with FoundationModels — run locally with --ignored"]
+fn unexpressible_literal_constraints_are_refused_with_typed_errors() {
+    let app = mock_app();
+
+    let cases = [
+        (
+            "boolean const",
+            serde_json::json!({
+                "type": "object",
+                "properties": {"cancelled": {"type": "boolean", "const": true}},
+                "required": ["cancelled"],
+            }),
+        ),
+        (
+            "boolean mixed into an enum",
+            serde_json::json!({
+                "type": "object",
+                "properties": {"deck": {"enum": ["upper", true]}},
+                "required": ["deck"],
+            }),
+        ),
+        (
+            "non-scalar enum member",
+            serde_json::json!({
+                "type": "object",
+                "properties": {"deck": {"enum": [{"level": 2}]}},
+                "required": ["deck"],
+            }),
+        ),
+    ];
+
+    for (label, schema) in cases {
+        let message = app
+            .apple_intelligence()
+            .generate(user_request("Describe the crossing.", schema))
+            .expect_err("an unexpressible literal constraint must be refused")
             .to_string();
         assert!(
             message.contains("unsupported-guide"),

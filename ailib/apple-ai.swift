@@ -615,6 +615,14 @@ private func mapToBridgeError(_ error: Error) -> BridgeError {
             return BridgeError(code: "unknown", message: message)
         }
     }
+    // A guide the converter built but `GenerationSchema` rejected (duplicate type names, an
+    // undefined `$ref`, an empty set of choices). It is a schema problem, not an unknown one, and
+    // hosts branch on `unsupported-guide` to fall back to free-text parsing.
+    if let schemaError = error as? GenerationSchema.SchemaError {
+        return BridgeError(
+            code: "unsupported-guide",
+            message: schemaError.errorDescription ?? String(describing: schemaError))
+    }
     if let toolError = error as? LanguageModelSession.ToolCallError {
         return BridgeError(
             code: "tool-call-error",
@@ -1452,6 +1460,81 @@ private func jsonSchemaTypeNames(_ dict: [String: Any]) -> [String] {
     return []
 }
 
+/// A schema node as a dictionary. JSON Schema also allows the boolean schemas `true` ("anything
+/// validates") and `false` ("nothing validates"); `true` is exactly the empty schema `{}`, and
+/// `false` has no expressible counterpart, so it comes back `nil` and the caller refuses it.
+/// Silently skipping either — which is what `as? [String: Any]` did — dropped whole properties out
+/// of the guide, so the model was never told a required field existed.
+private func jsonSchemaObject(_ node: Any) -> [String: Any]? {
+    if let dict = node as? [String: Any] { return dict }
+    if isJSONBoolean(node), let flag = node as? Bool, flag { return [:] }
+    return nil
+}
+
+/// Whether a JSON value decoded by `JSONSerialization` is a boolean rather than a number.
+///
+/// `JSONSerialization` hands back `NSNumber` for both, and `NSNumber(value: 1) as? Bool` succeeds —
+/// so a plain `is Bool` test reports `1` as a boolean and `true as? Double` yields `1.0`. Only the
+/// CoreFoundation type ID separates them reliably.
+private func isJSONBoolean(_ value: Any) -> Bool {
+    CFGetTypeID(value as CFTypeRef) == CFBooleanGetTypeID()
+}
+
+/// A finite JSON number, or `nil` for booleans, non-numbers, and NaN/infinity.
+private func jsonSchemaNumber(_ value: Any?) -> Double? {
+    guard let value, !isJSONBoolean(value), let number = value as? NSNumber else { return nil }
+    let double = number.doubleValue
+    return double.isFinite ? double : nil
+}
+
+/// Key-order-independent text for a schema node, used to decide whether the members of a tuple are
+/// the same shape (and therefore expressible as a fixed-length array).
+private func canonicalSchemaText(_ node: Any) -> String? {
+    guard JSONSerialization.isValidJSONObject([node]),
+        let data = try? JSONSerialization.data(withJSONObject: [node], options: [.sortedKeys])
+    else { return nil }
+    return String(data: data, encoding: .utf8)
+}
+
+/// The keyword making this object an *open map* (`z.record(...)`, `patternProperties`, or a bare
+/// `propertyNames` constraint) rather than a fixed set of named fields — or `nil` when it is an
+/// ordinary closed object.
+///
+/// `additionalProperties: false` is the ordinary closed-object case every `z.object()` emits and is
+/// deliberately not a map signal.
+private func openMapKeyword(_ dict: [String: Any]) -> String? {
+    if let additional = dict["additionalProperties"] {
+        if isJSONBoolean(additional) {
+            if (additional as? Bool) == true { return "additionalProperties" }
+        } else if additional is [String: Any] {
+            return "additionalProperties"
+        }
+    }
+    if let patterns = dict["patternProperties"] as? [String: Any], !patterns.isEmpty {
+        return "patternProperties"
+    }
+    if dict["propertyNames"] != nil { return "propertyNames" }
+    return nil
+}
+
+/// The positional member schemas of a tuple: `prefixItems` (2020-12, what zod v4 emits) or the
+/// draft-07 spelling where `items` is an *array* instead of a schema object.
+private func tuplePrefixItems(_ dict: [String: Any]) -> [Any]? {
+    if let prefix = dict["prefixItems"] as? [Any] { return prefix }
+    if let items = dict["items"] as? [Any] { return items }
+    return nil
+}
+
+/// The schema for elements *beyond* the tuple's positional members, or `nil` when the tuple is
+/// closed. `items` is the 2020-12 spelling (alongside `prefixItems`), `additionalItems` the
+/// draft-07 one; the boolean `false` closes the tuple in both.
+private func tupleRestItems(_ dict: [String: Any]) -> Any? {
+    let rest = dict["prefixItems"] != nil ? dict["items"] : dict["additionalItems"]
+    guard let rest else { return nil }
+    if isJSONBoolean(rest) { return (rest as? Bool) == true ? rest : nil }
+    return rest
+}
+
 /// The union members of a node, from `anyOf` or `oneOf`.
 ///
 /// Guided generation has no exclusive-union primitive, so `oneOf` is expressed the same way as
@@ -1479,6 +1562,133 @@ private func nullDynamicSchema() throws -> DynamicGenerationSchema {
                 + "free-text parsing.")
     }
     return .null
+}
+
+/// The inclusive integer bounds a node declares, honoring both the inclusive (`minimum`) and the
+/// 2020-12 exclusive (`exclusiveMinimum`) spellings. Exclusive bounds are exact on integers —
+/// `exclusiveMinimum: 0` is `minimum: 1` — so nothing is widened by translating them. The draft-04
+/// boolean form (`exclusiveMinimum: true`) is not a number and is ignored.
+private func integerBounds(_ dict: [String: Any]) -> (lower: Int?, upper: Int?) {
+    var lower: Double? = jsonSchemaNumber(dict["minimum"]).map { $0.rounded(.up) }
+    if let exclusive = jsonSchemaNumber(dict["exclusiveMinimum"]) {
+        let bound = exclusive.rounded(.down) == exclusive ? exclusive + 1 : exclusive.rounded(.up)
+        lower = max(lower ?? bound, bound)
+    }
+    var upper: Double? = jsonSchemaNumber(dict["maximum"]).map { $0.rounded(.down) }
+    if let exclusive = jsonSchemaNumber(dict["exclusiveMaximum"]) {
+        let bound = exclusive.rounded(.up) == exclusive ? exclusive - 1 : exclusive.rounded(.down)
+        upper = min(upper ?? bound, bound)
+    }
+    return (lower.flatMap { Int(exactly: $0) }, upper.flatMap { Int(exactly: $0) })
+}
+
+/// Bound guides for an `integer` node. `minimum`/`maximum` are applied separately rather than as a
+/// `ClosedRange`, so a contradictory schema (`minimum` above `maximum`) cannot trip the range
+/// precondition and trap the process — it just produces a guide nothing satisfies.
+@available(macOS 26.0, *)
+private func integerGuides(_ dict: [String: Any]) -> [GenerationGuide<Int>] {
+    let bounds = integerBounds(dict)
+    var guides: [GenerationGuide<Int>] = []
+    if let lower = bounds.lower { guides.append(.minimum(lower)) }
+    if let upper = bounds.upper { guides.append(.maximum(upper)) }
+    return guides
+}
+
+/// Bound guides for a `number` node. Only the inclusive bounds are honored: `GenerationGuide` has
+/// no open bound, and widening `exclusiveMinimum: 0` to `minimum: 0` would tell the model that `0`
+/// is a legal answer when the caller's own validator rejects it.
+@available(macOS 26.0, *)
+private func numberGuides(_ dict: [String: Any]) -> [GenerationGuide<Double>] {
+    var guides: [GenerationGuide<Double>] = []
+    if let lower = jsonSchemaNumber(dict["minimum"]) { guides.append(.minimum(lower)) }
+    if let upper = jsonSchemaNumber(dict["maximum"]) { guides.append(.maximum(upper)) }
+    return guides
+}
+
+/// A schema pinned to exactly one number. Guided generation has no numeric literal, but a bound of
+/// `[v, v]` admits exactly `v`, so this is an exact translation rather than a widening. Integral
+/// values are pinned as `Int` so the guide reads `"type": "integer"`.
+@available(macOS 26.0, *)
+private func pinnedNumberSchema(_ value: Double) -> DynamicGenerationSchema {
+    if let exact = Int(exactly: value) {
+        return .init(type: Int.self, guides: [.minimum(exact), .maximum(exact)])
+    }
+    return .init(type: Double.self, guides: [.minimum(value), .maximum(value)])
+}
+
+/// Convert an `enum` list (or a one-element list standing in for `const`) into a schema.
+///
+/// String members collapse into Apple's `anyOf: [String]` form, numbers become pinned constants,
+/// and `null` becomes the real null schema. Booleans are the one member kind with no expressible
+/// literal — there is no boolean guide — so a boolean literal is refused rather than widened into
+/// a free `true`/`false` the model was never told anything about. The one exception is the complete
+/// boolean domain (`[true, false]`), which constrains nothing and is just `Bool`.
+@available(macOS 26.0, *)
+private func literalChoicesSchema(
+    _ values: [Any],
+    label: String,
+    description: String?,
+    allocator: SchemaNameAllocator,
+    mayInline: Bool,
+    name: () -> String
+) throws -> DynamicGenerationSchema {
+    guard !values.isEmpty else {
+        throw ConversationError.unsupportedSchema(
+            "The schema for \"\(label)\" has an empty 'enum', so no value can satisfy it.")
+    }
+
+    let booleans = values.filter { isJSONBoolean($0) }
+    if booleans.count == values.count {
+        guard Set(booleans.map { ($0 as? Bool) == true }) == [true, false] else {
+            throw ConversationError.unsupportedSchema(
+                "The schema for \"\(label)\" pins a boolean literal, which Apple's guided "
+                    + "generation cannot express — it has no boolean literal guide. Model the flag "
+                    + "as a string enum, or drop the literal and validate it yourself.")
+        }
+        return .init(type: Bool.self)
+    }
+
+    var stringChoices: [String] = []
+    var dynamicChoices: [DynamicGenerationSchema] = []
+    for value in values {
+        if isJSONBoolean(value) {
+            throw ConversationError.unsupportedSchema(
+                "The schema for \"\(label)\" mixes a boolean literal into an 'enum', which Apple's "
+                    + "guided generation cannot express.")
+        }
+        if let text = value as? String {
+            stringChoices.append(text)
+            continue
+        }
+        if let number = jsonSchemaNumber(value) {
+            dynamicChoices.append(pinnedNumberSchema(number))
+            continue
+        }
+        if value is NSNull {
+            dynamicChoices.append(try nullDynamicSchema())
+            continue
+        }
+        throw ConversationError.unsupportedSchema(
+            "The schema for \"\(label)\" pins a non-scalar 'enum' member, which Apple's guided "
+                + "generation cannot express. Only strings, numbers and null can be pinned.")
+    }
+
+    if dynamicChoices.isEmpty {
+        return .init(name: name(), description: description, anyOf: stringChoices)
+    }
+    if !stringChoices.isEmpty {
+        dynamicChoices.insert(
+            .init(
+                name: allocator.allocate(preferred: "\(label)Literal"), description: nil,
+                anyOf: stringChoices),
+            at: 0)
+    }
+    // A single non-string literal needs no union wrapper — and no name, which keeps it inline in
+    // the guide instead of pushing a one-member `$defs` entry the model has to follow. Not an
+    // option for a `definitions`/`$defs` entry: those are registered as dependencies and reached by
+    // name, so an unnamed one leaves every `$ref` at it undefined.
+    if mayInline, dynamicChoices.count == 1 { return dynamicChoices[0] }
+    return .init(name: name(), description: description, anyOf: dynamicChoices)
 }
 
 /// Walk a schema node and refuse the shapes guided generation cannot express, so the caller gets a
@@ -1524,8 +1734,18 @@ private func assertSchemaNodeIsExpressible(
             try assertSchemaNodeIsExpressible(value, definitions: definitions, stack: &stack)
         }
     }
-    if let items = dict["items"] {
-        try assertSchemaNodeIsExpressible(items, definitions: definitions, stack: &stack)
+    // `items` is a schema in the array case and a list of positional schemas in the draft-07 tuple
+    // case; `prefixItems` is the 2020-12 spelling of the latter. All three are converted, so a
+    // reference cycle hiding under any of them has to be caught here.
+    for key in ["items", "prefixItems"] {
+        guard let node = dict[key] else { continue }
+        if let members = node as? [Any] {
+            for member in members {
+                try assertSchemaNodeIsExpressible(member, definitions: definitions, stack: &stack)
+            }
+        } else {
+            try assertSchemaNodeIsExpressible(node, definitions: definitions, stack: &stack)
+        }
     }
     // `oneOf` and `allOf` are walked alongside `anyOf`: a reference cycle hidden under either of
     // them is just as unexpressible, and skipping them let one through the gate.
@@ -1581,6 +1801,20 @@ private func convertJSONSchemaToDynamic(
             allocator: allocator, referenceNames: referenceNames)
     }
 
+    // OpenAPI 3.0 spells nullability `nullable: true` instead of a `null` union member, and schemas
+    // converted from OpenAPI carry it. Reading only the JSON Schema spellings left those fields as
+    // plain non-nullable values — the same silent failure as the dropped `null` member: the model
+    // cannot answer "nothing here", so it invents something, and the caller's validator accepts it.
+    if dict["nullable"] as? Bool == true {
+        var inner = dict
+        inner.removeValue(forKey: "nullable")
+        let base = try convertJSONSchemaToDynamic(
+            inner, preferredName: "\(preferredName)Value", allocator: allocator,
+            referenceNames: referenceNames)
+        return .init(
+            name: name(), description: description, anyOf: [base, try nullDynamicSchema()])
+    }
+
     if let union = jsonSchemaUnionChoices(dict) {
         // String-literal members (`{"enum": [...]}` / `{"const": "..."}`) collapse into Apple's
         // `anyOf: [String]` form; every other member converts to a schema of its own. A `null`
@@ -1618,15 +1852,21 @@ private func convertJSONSchemaToDynamic(
         return .init(name: name(), description: description, anyOf: dynamicChoices)
     }
 
-    // Enum handling
-    if let enums = dict["enum"] as? [String] {
-        return .init(name: name(), description: description, anyOf: enums)
+    // `enum` / `const` of any scalar type. Reading only `[String]` and `String` here dropped the
+    // non-string half entirely: `{"type": "integer", "enum": [1, 2, 3]}` became a free integer and
+    // `{"type": "number", "const": 42}` a free number, with the model never told the constraint.
+    if let enums = dict["enum"] as? [Any] {
+        return try literalChoicesSchema(
+            enums, label: preferredName, description: description, allocator: allocator,
+            mayInline: assignedName == nil, name: name)
     }
-    // A bare string literal (`z.literal("x")` → `{"type": "string", "const": "x"}`). Pinning it to
-    // a one-member choice keeps the guide honest; treating it as a free string let the model answer
-    // anything and pushed the failure into the caller's validator.
-    if let literal = dict["const"] as? String {
-        return .init(name: name(), description: description, anyOf: [literal])
+    // A bare literal (`z.literal("x")` → `{"type": "string", "const": "x"}`). Pinning it keeps the
+    // guide honest; treating it as a free value let the model answer anything and pushed the
+    // failure into the caller's validator.
+    if let literal = dict["const"] {
+        return try literalChoicesSchema(
+            [literal], label: preferredName, description: description, allocator: allocator,
+            mayInline: assignedName == nil, name: name)
     }
 
     let types = jsonSchemaTypeNames(dict)
@@ -1657,34 +1897,101 @@ private func convertJSONSchemaToDynamic(
     case "string":
         return .init(type: String.self)
     case "number":
-        return .init(type: Double.self)
+        return .init(type: Double.self, guides: numberGuides(dict))
     case "integer":
-        return .init(type: Int.self)
+        return .init(type: Int.self, guides: integerGuides(dict))
     case "boolean":
         return .init(type: Bool.self)
     case "null":
         return try nullDynamicSchema()
     case "array":
-        if let items = dict["items"] as? [String: Any] {
-            let itemSchema = try convertJSONSchemaToDynamic(
-                items, preferredName: "\(preferredName)Item", allocator: allocator,
-                referenceNames: referenceNames)
-            let min = dict["minItems"] as? Int
-            let max = dict["maxItems"] as? Int
-            return .init(arrayOf: itemSchema, minimumElements: min, maximumElements: max)
-        } else {
-            // Unknown items, fallback
-            return .init(arrayOf: .init(type: String.self))
+        let min = dict["minItems"] as? Int
+        let max = dict["maxItems"] as? Int
+
+        // A tuple: `prefixItems` (2020-12) or an array-valued `items` (draft-07). `items as?
+        // [String: Any]` matched neither, so the whole positional contract fell through to the
+        // array-of-string fallback — `z.tuple([z.string(), z.number()])` came back as
+        // `["Piraeus", "1834"]`, arity and element types gone.
+        if let prefix = tuplePrefixItems(dict) {
+            if tupleRestItems(dict) != nil {
+                throw ConversationError.unsupportedSchema(
+                    "The schema for \"\(preferredName)\" is a tuple with additional trailing "
+                        + "items, which Apple's guided generation cannot express: an array guide "
+                        + "carries a single element schema and a length range, not per-position "
+                        + "types. Model it as an object with named fields, or as a uniform array.")
+            }
+            // A tuple whose members are all the same shape *is* a fixed-length array, which the
+            // framework expresses exactly. Anything heterogeneous is refused: coercing it into
+            // `array of (a | b)` would discard the positional contract without a word.
+            let shapes = prefix.compactMap { canonicalSchemaText($0) }
+            guard shapes.count == prefix.count, Set(shapes).count <= 1 else {
+                throw ConversationError.unsupportedSchema(
+                    "The schema for \"\(preferredName)\" is a tuple of \(prefix.count) differently "
+                        + "typed members, which Apple's guided generation cannot express: an array "
+                        + "guide carries a single element schema, not per-position types. Model it "
+                        + "as an object with named fields, or as a uniform array.")
+            }
+            let itemSchema =
+                try prefix.first.map { member -> DynamicGenerationSchema in
+                    guard let memberDict = jsonSchemaObject(member) else {
+                        throw ConversationError.unsupportedSchema(
+                            "The schema for \"\(preferredName)\" has a tuple member that is not a "
+                                + "schema object.")
+                    }
+                    return try convertJSONSchemaToDynamic(
+                        memberDict, preferredName: "\(preferredName)Item", allocator: allocator,
+                        referenceNames: referenceNames)
+                } ?? .init(type: String.self)
+            return .init(
+                arrayOf: itemSchema, minimumElements: prefix.count, maximumElements: prefix.count)
         }
+
+        if let items = dict["items"], let itemsDict = jsonSchemaObject(items) {
+            let itemSchema = try convertJSONSchemaToDynamic(
+                itemsDict, preferredName: "\(preferredName)Item", allocator: allocator,
+                referenceNames: referenceNames)
+            return .init(arrayOf: itemSchema, minimumElements: min, maximumElements: max)
+        }
+        // No item schema at all (`{"type": "array"}` — an array of anything). A narrowing to
+        // strings, not a wrong answer, exactly like the untyped fallback below; the declared length
+        // bounds still apply.
+        return .init(
+            arrayOf: .init(type: String.self), minimumElements: min, maximumElements: max)
     case "object":
+        let declared = dict["properties"] as? [String: Any]
+
+        // An open map (`z.record(...)` → `additionalProperties` with no `properties`, or the
+        // `patternProperties`/`propertyNames` spellings) has no counterpart in guided generation:
+        // an object guide is a fixed list of named properties. This used to build that list empty,
+        // so the guide said `{"properties":{},"additionalProperties":false}` and the model could
+        // only ever answer `{}` — which `z.record()` then accepted, reporting nothing anywhere.
+        //
+        // The open keyword is only fatal when there are no declared properties. Beside real ones
+        // (`z.looseObject()`) it merely *permits* extra keys without requiring any, so generating
+        // just the declared properties is a narrowing nothing downstream can reject.
+        if let keyword = openMapKeyword(dict), declared?.isEmpty != false {
+            throw ConversationError.unsupportedSchema(
+                "The schema for \"\(preferredName)\" is an open map (object with '\(keyword)' and "
+                    + "no declared 'properties'), which Apple's guided generation cannot express — "
+                    + "an object guide is a fixed list of named properties, so the model could "
+                    + "only answer with an empty object. Declare the keys you expect, or ask for "
+                    + "an array of key/value objects.")
+        }
+
         // Claimed before the children are converted, so a nested schema can never take this name
         // and turn a child into a `$ref` back at its own ancestor.
         let objectName = name()
         let required = (dict["required"] as? [String]) ?? []
         var props: [DynamicGenerationSchema.Property] = []
-        if let properties = dict["properties"] as? [String: Any] {
+        if let properties = declared {
             for (propName, subSchemaAny) in properties {
-                guard let subSchemaDict = subSchemaAny as? [String: Any] else { continue }
+                // A property whose schema is not an object used to be skipped, dropping it out of
+                // the guide entirely — the model was never told a required field existed.
+                guard let subSchemaDict = jsonSchemaObject(subSchemaAny) else {
+                    throw ConversationError.unsupportedSchema(
+                        "Property \"\(propName)\" has the schema `false`, which nothing can "
+                            + "satisfy, or a value that is not a schema at all.")
+                }
                 let subSchema = try convertJSONSchemaToDynamic(
                     subSchemaDict, preferredName: propName, allocator: allocator,
                     referenceNames: referenceNames)

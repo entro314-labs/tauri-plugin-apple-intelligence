@@ -222,9 +222,50 @@ catches the error: let the plugin's gate refuse it.
 
 `generateObject`/`streamObject` (and tool parameter schemas) accept a JSON Schema, which the plugin
 converts into a FoundationModels `GenerationSchema`. Supported: objects, nested objects, arrays
-(including **arrays of objects**), string/number/integer/boolean, **`null`**, `enum`, `const`
-(string literals), `anyOf`, `oneOf`, single-member `allOf`, `minItems`/`maxItems`, `required`,
-`description`, and `$ref` into `definitions` (draft-07) or `$defs` (2020-12).
+(including **arrays of objects**), string/number/integer/boolean, **`null`**, `enum` and `const`
+(**string, number and integer** literals), `anyOf`, `oneOf`, single-member `allOf`,
+`minItems`/`maxItems`, **`minimum`/`maximum`** (and `exclusiveMinimum`/`exclusiveMaximum` on
+integers), `required`, `description`, and `$ref` into `definitions` (draft-07) or `$defs`
+(2020-12).
+
+### Numbers, literals, and bounds
+
+Guided generation has no numeric-literal primitive, but `GenerationGuide` has numeric bounds, and a
+bound of `[v, v]` admits exactly `v` — so numeric literals are expressed exactly rather than
+widened:
+
+| JSON Schema | Guide the model sees |
+| --- | --- |
+| `{"type": "number", "const": 42}` | `{"type": "integer", "minimum": 42, "maximum": 42}` |
+| `{"type": "integer", "enum": [2, 4, 8]}` | `anyOf` of three pinned integers |
+| `{"anyOf": [{"const": 1}, {"const": 2}]}` (zod's numeric enum) | `anyOf` of two pinned numbers |
+| `{"enum": ["deck", 7]}` | `anyOf` of a string-literal group and a pinned number |
+| `{"type": "integer", "minimum": 1, "maximum": 5}` | `{"type": "integer", "minimum": 1, "maximum": 5}` |
+| `{"type": "integer", "exclusiveMinimum": 0}` | `{"type": "integer", "minimum": 1}` |
+
+> Before 0.9.0 only *string* `enum`/`const` were read. `{"type": "integer", "enum": [2, 4, 8]}`
+> became a free integer and `{"type": "number", "const": 42}` a free number — the model was never
+> told the constraint, so it answered outside it and the caller's validator rejected a result the
+> model could have got right.
+
+`exclusiveMinimum`/`exclusiveMaximum` on **`number`** are dropped rather than widened to their
+inclusive form: `GenerationGuide` has no open bound, and telling the model `minimum: 0` when the
+caller means "> 0" would advertise an answer the caller's own validator rejects. Values are still
+checked by your own schema, so the failure is loud.
+
+### Fixed-length arrays (tuples)
+
+A tuple — `{"prefixItems": [...]}` (2020-12) or the draft-07 `{"items": [...]}` — is honored when
+its members all have the **same** shape, which is exactly a fixed-length array:
+`z.tuple([z.string(), z.string()])` generates an array of exactly two strings.
+
+A tuple with **differently typed** members (`z.tuple([z.string(), z.number()])`) or with a trailing
+rest schema is refused with `unsupported-guide`: an array guide carries one element schema and a
+length range, not per-position types.
+
+> Before 0.9.0 neither spelling was recognised at all — `items` was only read as an object — so
+> every tuple fell through to an *unbounded array of strings*. `z.tuple([z.string(), z.number()])`
+> came back as `["Piraeus", "1834"]`, with the number stringified and the arity gone.
 
 ### Nullable fields
 
@@ -242,8 +283,36 @@ key); `.nullish()` allows both.
 > *accepted*, because a string does satisfy `string | null`. Nullable fields validated against
 > versions ≤ 0.7.1 should be re-checked; the failure left no error anywhere.
 
+The OpenAPI 3.0 spelling `{"type": "string", "nullable": true}` is honored the same way (0.9.0+ —
+it was not read at all before, so OpenAPI-derived schemas had the pre-0.8.0 failure).
+
 Nullable fields need **macOS 26.4+** (`DynamicGenerationSchema.null`). On macOS 26.0–26.3 they are
 refused with `unsupported-guide` rather than silently flattened.
+
+### Open maps (`z.record`) are refused
+
+`z.record(z.string(), z.string())` emits `{"type": "object", "additionalProperties": {...}}` with no
+`properties`. An object guide is a **fixed list of named properties** — `DynamicGenerationSchema`
+has no map-shaped constructor at all — so there is nothing to convert this into. It is refused with
+`unsupported-guide`, naming the property. The `patternProperties` (draft-07) and bare
+`propertyNames` spellings are refused the same way.
+
+Model the map as declared keys, or as an array of `{key, value}` objects:
+
+```ts
+// Refused:  z.object({ labels: z.record(z.string(), z.string()) })
+// Works:    z.object({ labels: z.array(z.object({ key: z.string(), value: z.string() })) })
+```
+
+> Before 0.9.0 this built an object with **zero** properties, so the guide literally said
+> `{"properties": {}, "additionalProperties": false}` and the model could only ever answer `{}` —
+> which `z.record()` then *accepted*. Nothing reported an error anywhere. Any `z.record()` field
+> validated against ≤ 0.8.0 came back empty; re-check those call sites.
+
+`additionalProperties` beside **declared** `properties` is not affected. `additionalProperties:
+false` is the ordinary closed object every `z.object()` emits, and `additionalProperties: true`/`{}`
+(`z.looseObject()`) merely *permits* extra keys without requiring any — so the declared properties
+are generated and the open part is ignored, which is a narrowing nothing downstream can reject.
 
 ### Shapes that are refused
 
@@ -258,10 +327,35 @@ These cannot be expressed by the framework at all, and are refused up front with
   its one member and is accepted.)
 - **Unknown `type` values** — anything outside string/number/integer/boolean/array/object/null.
 - **`null` on macOS 26.0–26.3**, as above.
+- **Open maps** — `additionalProperties`/`patternProperties`/`propertyNames` with no declared
+  `properties`, as above.
+- **Heterogeneous tuples** and tuples with a trailing rest schema, as above.
+- **Boolean literals** — `z.literal(true)`, `{"type": "boolean", "const": true}`. There is no
+  boolean guide, so the literal cannot be pinned; `{"enum": [true, false]}` is just `boolean` and is
+  accepted. Model the flag as a string enum if it must be pinned.
+- **Non-scalar `enum` members** — an `enum` containing an object or array. Only strings, numbers and
+  `null` can be pinned.
+- **The schema `false`** for a property, and any property value that is not a schema. (`true` is the
+  empty schema and is accepted.)
 
 A schema node with no `type` at all (`{}`, what zod emits for `any`/`unknown`) is generated as a
 string. That is a narrowing rather than a wrong answer — `{}` accepts any instance, so nothing
-downstream can reject the result — so it is not refused.
+downstream can reject the result — so it is not refused. A bare `{"type": "object"}` (no
+`properties` and no `additionalProperties`) is generated as the empty object for the same reason.
+
+### Keywords that are ignored
+
+These are dropped from the guide, so the model is not told about them. Nothing is silently
+*mis*-stated: a value that violates one is rejected by your own schema, loudly, at the call site.
+
+| Keyword | Why |
+| --- | --- |
+| `pattern` | `GenerationGuide.pattern` takes a Swift `Regex`, whose syntax is not JSON Schema's ECMA-262 dialect; a mis-translated pattern would over-constrain the model silently. |
+| `minLength`, `maxLength`, `format` | No corresponding guide. |
+| `not` | No corresponding guide. |
+| `exclusiveMinimum`/`exclusiveMaximum` on `number` | No open bound; see above. |
+| `description` beside a `$ref` in a non-property position | `referenceTo:` carries no description. On a property it survives as the property's description. |
+| `additionalProperties` beside declared `properties` | Deliberate — see above. |
 
 ```ts
 try {
@@ -309,8 +403,9 @@ To rebuild the dylib from source (macOS 26+): `scripts/build.sh`.
 cargo test
 # Live probes against the real model (needs Apple Intelligence enabled): context/token budgeting,
 # the Private Cloud Compute entitlement gate, nested array-of-object schemas, shared `$defs`
-# references, nullable fields (`anyOf` + array `type` spellings), and the typed refusal for
-# recursive schemas.
+# references, nullable fields (`anyOf`, array `type`, and OpenAPI `nullable` spellings), non-string
+# `enum`/`const` and numeric bounds, fixed-length tuples, and the typed refusals for recursive
+# schemas, open maps, heterogeneous tuples, and boolean literals.
 cargo test --test native_probes -- --ignored
 cargo test --test mock_app_stream -- --ignored
 
