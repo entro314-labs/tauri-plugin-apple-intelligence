@@ -17,7 +17,7 @@ One repo, two artifacts:
 ```toml
 # src-tauri/Cargo.toml
 [dependencies]
-tauri-plugin-apple-intelligence = "0.7"
+tauri-plugin-apple-intelligence = "0.8"
 ```
 
 ```bash
@@ -194,20 +194,74 @@ entitlement you have not been granted makes the system refuse to launch the proc
 
 Apps that *do* hold the entitlement are unaffected: the gate passes and PCC behaves as before.
 
+### What an unentitled PCC call actually does
+
+Measured on macOS 27.0 (26A5388g, Apple silicon), with the entitlement gate removed, from both a
+bare CLI binary and a sandboxed hardened-runtime `.app` with a bundle identifier:
+
+| Path | Unentitled result |
+| --- | --- |
+| `PrivateCloudComputeLanguageModel()` | constructs |
+| `.availability` / `.isAvailable` | reports `available` / `true` (the false positive) |
+| `.quotaUsage`, `.supportedLanguages`, `.capabilities`, `.contextSize` | answer normally (`contextSize` = 32768) |
+| `LanguageModelSession(model:)`, `.prewarm()` | succeed, no abort |
+| `.respond`, `.streamResponse`, structured `respond`, tool-calling `respond` | **throw** `LanguageModelError -1` wrapping `ModelManagerError 1046` |
+
+Every path is recoverable — nothing aborts the process. Reports of a hard
+`fatalError("Process is missing required entitlement: com.apple.developer.private-cloud-compute")`
+could not be reproduced on this build, and that string does not appear anywhere in its dyld shared
+cache. It may have existed on an earlier macOS 27 seed; a seed-dependent process abort is not
+something one machine can rule out.
+
+The plugin therefore does not rely on the failure being catchable. It refuses **before**
+`PrivateCloudComputeLanguageModel` is constructed on every path, so an unentitled process never
+reaches framework code that could decide to abort. Do not write consumer code that calls PCC and
+catches the error: let the plugin's gate refuse it.
+
 ## Structured output (guided generation)
 
 `generateObject`/`streamObject` (and tool parameter schemas) accept a JSON Schema, which the plugin
 converts into a FoundationModels `GenerationSchema`. Supported: objects, nested objects, arrays
-(including **arrays of objects**), string/number/integer/boolean, `enum`, `anyOf`, `minItems`/
-`maxItems`, `required`, `description`, and `$ref` into `definitions` (draft-07) or `$defs`
-(2020-12).
+(including **arrays of objects**), string/number/integer/boolean, **`null`**, `enum`, `const`
+(string literals), `anyOf`, `oneOf`, single-member `allOf`, `minItems`/`maxItems`, `required`,
+`description`, and `$ref` into `definitions` (draft-07) or `$defs` (2020-12).
 
-Two shapes cannot be expressed by the framework at all, and are refused up front with the typed
+### Nullable fields
+
+`z.string().nullable()` — `{"anyOf": [{"type": "string"}, {"type": "null"}]}` — and the array
+spelling `{"type": ["string", "null"]}` are both honored: the field's guide carries a real `null`
+member, the model can answer `null`, and the plugin returns JSON `null`.
+
+Use `.nullable()`, not `.optional()`, for fields the model may have nothing to say about — it is
+also the portable choice, since `.optional()` breaks strict structured-output mode on OpenAI/Azure.
+`.optional()` still works here (the property is simply not `required`, and the model may omit the
+key); `.nullish()` allows both.
+
+> Before 0.8.0 the `null` member was dropped and the field became a plain string, so the model could
+> not express absence and answered with a fabricated value — which the caller's own Zod check then
+> *accepted*, because a string does satisfy `string | null`. Nullable fields validated against
+> versions ≤ 0.7.1 should be re-checked; the failure left no error anywhere.
+
+Nullable fields need **macOS 26.4+** (`DynamicGenerationSchema.null`). On macOS 26.0–26.3 they are
+refused with `unsupported-guide` rather than silently flattened.
+
+### Shapes that are refused
+
+These cannot be expressed by the framework at all, and are refused up front with the typed
 `unsupported-guide` code rather than answered with a plausible-looking wrong object:
 
 - **Recursive schemas** — a definition that (directly or transitively) contains itself, or a
   `"$ref": "#"` back at the whole document. The guide would have to be infinitely deep.
 - **Unresolvable `$ref`s** — a reference with no matching entry under `definitions`/`$defs`.
+- **Multi-member `allOf`** — a schema intersection. Flatten it into one object schema. (A
+  single-member `allOf`, the "wrap a `$ref` so a `description` can sit beside it" idiom, is just
+  its one member and is accepted.)
+- **Unknown `type` values** — anything outside string/number/integer/boolean/array/object/null.
+- **`null` on macOS 26.0–26.3**, as above.
+
+A schema node with no `type` at all (`{}`, what zod emits for `any`/`unknown`) is generated as a
+string. That is a narrowing rather than a wrong answer — `{}` accepts any instance, so nothing
+downstream can reject the result — so it is not refused.
 
 ```ts
 try {
@@ -239,7 +293,8 @@ To rebuild the dylib from source (macOS 26+): `scripts/build.sh`.
 
 - ✅ macOS 26+ on Apple Silicon (on-device model, streaming, tools, structured output, sampling
   modes, typed error codes)
-- ✅ macOS 26.4+ adds `token_count` (`tokenCount(for:)`)
+- ✅ macOS 26.4+ adds `token_count` (`tokenCount(for:)`) and nullable schema fields
+  (`DynamicGenerationSchema.null`)
 - ✅ macOS 27+ adds Private Cloud Compute (entitlement-gated — see
   [Private Cloud Compute](#private-cloud-compute)), reasoning levels, multimodal image input,
   per-call token usage, native `toolChoice` enforcement, and context-size details on
@@ -254,7 +309,8 @@ To rebuild the dylib from source (macOS 26+): `scripts/build.sh`.
 cargo test
 # Live probes against the real model (needs Apple Intelligence enabled): context/token budgeting,
 # the Private Cloud Compute entitlement gate, nested array-of-object schemas, shared `$defs`
-# references, and the typed refusal for recursive schemas.
+# references, nullable fields (`anyOf` + array `type` spellings), and the typed refusal for
+# recursive schemas.
 cargo test --test native_probes -- --ignored
 cargo test --test mock_app_stream -- --ignored
 

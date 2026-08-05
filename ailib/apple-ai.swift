@@ -1440,6 +1440,47 @@ private func collectSchemaDefinitions(_ json: [String: Any]) -> [String: [String
     return definitions
 }
 
+/// The JSON Schema `type` of a node, as a list.
+///
+/// `"type": "string"` and `"type": ["string", "null"]` are both legal spellings, and the array form
+/// is how a generator that avoids `anyOf` expresses nullability. Reading `type` only as a `String`
+/// left every array-form node without a type at all, so it fell through to the untyped fallback and
+/// silently became a plain string.
+private func jsonSchemaTypeNames(_ dict: [String: Any]) -> [String] {
+    if let single = dict["type"] as? String { return [single] }
+    if let many = dict["type"] as? [String] { return many }
+    return []
+}
+
+/// The union members of a node, from `anyOf` or `oneOf`.
+///
+/// Guided generation has no exclusive-union primitive, so `oneOf` is expressed the same way as
+/// `anyOf`: the branches of a well-formed `oneOf` are mutually exclusive, so a value that satisfies
+/// one branch satisfies the `oneOf`. Reading only `anyOf` left every `oneOf` node falling through to
+/// the untyped fallback — the same silent degradation to `string`.
+private func jsonSchemaUnionChoices(_ dict: [String: Any]) -> [[String: Any]]? {
+    for key in ["anyOf", "oneOf"] {
+        if let choices = dict[key] as? [[String: Any]], !choices.isEmpty { return choices }
+    }
+    return nil
+}
+
+/// The `null` schema, or a typed refusal on an OS whose guided generation has no way to express one.
+///
+/// `DynamicGenerationSchema.null` landed in macOS 26.4. Below that a nullable field cannot be
+/// expressed at all, and the only honest answer is `unsupported-guide` — coercing it to `String`
+/// would let the model answer a question it should have been able to decline.
+@available(macOS 26.0, *)
+private func nullDynamicSchema() throws -> DynamicGenerationSchema {
+    guard #available(macOS 26.4, *) else {
+        throw ConversationError.unsupportedSchema(
+            "A nullable field (JSON Schema type \"null\") requires macOS 26.4 or later; this OS's "
+                + "guided generation cannot express one. Drop the null member, or fall back to "
+                + "free-text parsing.")
+    }
+    return .null
+}
+
 /// Walk a schema node and refuse the shapes guided generation cannot express, so the caller gets a
 /// typed `unsupported-guide` refusal it can fall back from — rather than a plausible-looking object
 /// that is quietly wrong.
@@ -1486,8 +1527,11 @@ private func assertSchemaNodeIsExpressible(
     if let items = dict["items"] {
         try assertSchemaNodeIsExpressible(items, definitions: definitions, stack: &stack)
     }
-    if let anyOf = dict["anyOf"] as? [Any] {
-        for choice in anyOf {
+    // `oneOf` and `allOf` are walked alongside `anyOf`: a reference cycle hidden under either of
+    // them is just as unexpressible, and skipping them let one through the gate.
+    for key in ["anyOf", "oneOf", "allOf"] {
+        guard let choices = dict[key] as? [Any] else { continue }
+        for choice in choices {
             try assertSchemaNodeIsExpressible(choice, definitions: definitions, stack: &stack)
         }
     }
@@ -1498,6 +1542,13 @@ private func assertSchemaNodeIsExpressible(
 /// `assignedName` is the already-allocated name for this node (used for the entries of
 /// `definitions`/`$defs`, whose names must match what `$ref`s resolve to); everything else passes
 /// `preferredName` and gets a unique variant of it from `allocator`.
+///
+/// Throws `ConversationError.unsupportedSchema` for the shapes guided generation genuinely cannot
+/// express. It must never fall back to `String` for a node whose meaning that would change: a
+/// `string | null` degraded to `string | string` is the worst possible outcome, because the model
+/// then cannot express absence, invents a value instead, and the caller's own validator *passes* it
+/// (a string does satisfy `string | null`). A typed refusal is recoverable; confident wrong data is
+/// not.
 @available(macOS 26.0, *)
 private func convertJSONSchemaToDynamic(
     _ dict: [String: Any],
@@ -1505,7 +1556,7 @@ private func convertJSONSchemaToDynamic(
     assignedName: String? = nil,
     allocator: SchemaNameAllocator,
     referenceNames: [String: String]
-) -> DynamicGenerationSchema {
+) throws -> DynamicGenerationSchema {
     // Resolved to the *allocated* name of the referenced definition — `referenceTo:` takes a schema
     // name, not a JSON pointer, so passing the raw `#/definitions/X` never matched anything.
     if let ref = dict["$ref"] as? String {
@@ -1516,40 +1567,89 @@ private func convertJSONSchemaToDynamic(
     let description = dict["description"] as? String
     func name() -> String { assignedName ?? allocator.allocate(preferred: preferredName) }
 
-    if let anyOf = dict["anyOf"] as? [[String: Any]] {
-        // Detect simple string enum union
+    // `allOf` is an intersection, which guided generation has no primitive for. A single-member
+    // `allOf` is the common "wrap a `$ref` so a description can sit beside it" idiom and *is* its
+    // one member; anything longer is refused rather than silently reduced to one branch.
+    if let allOf = dict["allOf"] as? [[String: Any]] {
+        guard allOf.count == 1, let only = allOf.first else {
+            throw ConversationError.unsupportedSchema(
+                "'allOf' with \(allOf.count) members is a schema intersection, which Apple's guided "
+                    + "generation cannot express. Flatten the intersection into one object schema.")
+        }
+        return try convertJSONSchemaToDynamic(
+            only, preferredName: preferredName, assignedName: assignedName,
+            allocator: allocator, referenceNames: referenceNames)
+    }
+
+    if let union = jsonSchemaUnionChoices(dict) {
+        // String-literal members (`{"enum": [...]}` / `{"const": "..."}`) collapse into Apple's
+        // `anyOf: [String]` form; every other member converts to a schema of its own. A `null`
+        // member becomes `DynamicGenerationSchema.null` via the type switch below, which is what
+        // makes `string | null` an actual nullable field instead of two indistinguishable strings.
         var stringChoices: [String] = []
         var dynamicChoices: [DynamicGenerationSchema] = []
-        for (index, choice) in anyOf.enumerated() {
-            if let enums = choice["enum"] as? [String], enums.count == 1 {
-                stringChoices.append(enums[0])
-            } else {
-                dynamicChoices.append(
-                    convertJSONSchemaToDynamic(
-                        choice, preferredName: "\(preferredName)Choice\(index + 1)",
-                        allocator: allocator, referenceNames: referenceNames))
+        for (index, choice) in union.enumerated() {
+            if let literals = choice["enum"] as? [String] {
+                stringChoices.append(contentsOf: literals)
+                continue
             }
+            if let literal = choice["const"] as? String {
+                stringChoices.append(literal)
+                continue
+            }
+            dynamicChoices.append(
+                try convertJSONSchemaToDynamic(
+                    choice, preferredName: "\(preferredName)Choice\(index + 1)",
+                    allocator: allocator, referenceNames: referenceNames))
         }
-        if !stringChoices.isEmpty && dynamicChoices.isEmpty {
+        if dynamicChoices.isEmpty {
             return .init(name: name(), description: description, anyOf: stringChoices)
         }
-        let choices =
-            dynamicChoices.isEmpty
-            ? anyOf.enumerated().map { index, choice in
-                convertJSONSchemaToDynamic(
-                    choice, preferredName: "\(preferredName)Choice\(index + 1)",
-                    allocator: allocator, referenceNames: referenceNames)
-            } : dynamicChoices
-        return .init(name: name(), description: description, anyOf: choices)
+        if !stringChoices.isEmpty {
+            // A union mixing string literals with structured members: the literals used to be
+            // dropped here whenever any structured member existed, so the model was never told
+            // they were legal answers.
+            dynamicChoices.insert(
+                .init(
+                    name: allocator.allocate(preferred: "\(preferredName)Literal"),
+                    description: nil, anyOf: stringChoices),
+                at: 0)
+        }
+        return .init(name: name(), description: description, anyOf: dynamicChoices)
     }
 
     // Enum handling
     if let enums = dict["enum"] as? [String] {
         return .init(name: name(), description: description, anyOf: enums)
     }
+    // A bare string literal (`z.literal("x")` → `{"type": "string", "const": "x"}`). Pinning it to
+    // a one-member choice keeps the guide honest; treating it as a free string let the model answer
+    // anything and pushed the failure into the caller's validator.
+    if let literal = dict["const"] as? String {
+        return .init(name: name(), description: description, anyOf: [literal])
+    }
 
-    guard let type = dict["type"] as? String else {
-        // Fallback to string
+    let types = jsonSchemaTypeNames(dict)
+
+    // Array-form nullability (`"type": ["string", "null"]`) — expanded into a real union so the
+    // `null` member survives instead of the whole node dropping to the untyped fallback.
+    if types.count > 1 {
+        var choices: [DynamicGenerationSchema] = []
+        for (index, typeName) in types.enumerated() {
+            var member = dict
+            member["type"] = typeName
+            choices.append(
+                try convertJSONSchemaToDynamic(
+                    member, preferredName: "\(preferredName)Choice\(index + 1)",
+                    allocator: allocator, referenceNames: referenceNames))
+        }
+        return .init(name: name(), description: description, anyOf: choices)
+    }
+
+    guard let type = types.first else {
+        // A node with no `type` at all — `{}`, what zod emits for `any`/`unknown` — accepts any
+        // instance, so answering with a string is a narrowing, not a wrong answer: nothing
+        // downstream can reject it. That is why this fallback is sound where the `null` one was not.
         return .init(type: String.self)
     }
 
@@ -1562,9 +1662,11 @@ private func convertJSONSchemaToDynamic(
         return .init(type: Int.self)
     case "boolean":
         return .init(type: Bool.self)
+    case "null":
+        return try nullDynamicSchema()
     case "array":
         if let items = dict["items"] as? [String: Any] {
-            let itemSchema = convertJSONSchemaToDynamic(
+            let itemSchema = try convertJSONSchemaToDynamic(
                 items, preferredName: "\(preferredName)Item", allocator: allocator,
                 referenceNames: referenceNames)
             let min = dict["minItems"] as? Int
@@ -1583,9 +1685,12 @@ private func convertJSONSchemaToDynamic(
         if let properties = dict["properties"] as? [String: Any] {
             for (propName, subSchemaAny) in properties {
                 guard let subSchemaDict = subSchemaAny as? [String: Any] else { continue }
-                let subSchema = convertJSONSchemaToDynamic(
+                let subSchema = try convertJSONSchemaToDynamic(
                     subSchemaDict, preferredName: propName, allocator: allocator,
                     referenceNames: referenceNames)
+                // Only `required` decides presence. A `.nullable()` field stays required and carries
+                // an explicit `null` in its union; marking it optional instead would let the model
+                // omit the key, which `z.string().nullable()` rejects.
                 let isOptional = !required.contains(propName)
                 let prop = DynamicGenerationSchema.Property(
                     name: propName, description: subSchemaDict["description"] as? String,
@@ -1595,7 +1700,9 @@ private func convertJSONSchemaToDynamic(
         }
         return .init(name: objectName, description: description, properties: props)
     default:
-        return .init(type: String.self)
+        throw ConversationError.unsupportedSchema(
+            "JSON Schema type \"\(type)\" is not a type Apple's guided generation can express. "
+                + "Expected one of: string, number, integer, boolean, array, object, null.")
     }
 }
 
@@ -1657,22 +1764,22 @@ private func buildSchemasFromJson(_ json: [String: Any]) throws -> (
         referenceNames[key] = allocator.allocate(preferred: key)
     }
 
-    let dependencies = definitionKeys.map { key in
-        convertJSONSchemaToDynamic(
+    let dependencies = try definitionKeys.map { key in
+        try convertJSONSchemaToDynamic(
             definitions[key]!, preferredName: key, assignedName: referenceNames[key],
             allocator: allocator, referenceNames: referenceNames)
     }
 
     // Determine root schema
     if let rootDefinitionKey, let rootDef = definitions[rootDefinitionKey] {
-        let root = convertJSONSchemaToDynamic(
+        let root = try convertJSONSchemaToDynamic(
             rootDef, preferredName: rootDefinitionKey, allocator: allocator,
             referenceNames: referenceNames)
         return (root, dependencies)
     }
 
     // Fallback
-    let root = convertJSONSchemaToDynamic(
+    let root = try convertJSONSchemaToDynamic(
         json, preferredName: json["title"] as? String ?? "Object", allocator: allocator,
         referenceNames: referenceNames)
     return (root, dependencies)

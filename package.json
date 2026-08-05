@@ -1,6 +1,6 @@
 {
   "name": "@entro314labs/plugin-apple-intelligence",
-  "version": "0.7.1",
+  "version": "0.8.0",
   "description": "Apple Intelligence for Tauri: guest bindings for tauri-plugin-apple-intelligence plus a Vercel AI SDK provider with pluggable transports",
   "repository": {
     "type": "git",

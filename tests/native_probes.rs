@@ -267,6 +267,147 @@ fn shared_definition_references_resolve() {
     }
 }
 
+/// `.nullable()` is the portable way to say "this field may be absent" — `.optional()` breaks
+/// strict structured-output mode on other providers, so schemas shared across providers use
+/// `z.string().nullable()`, which serializes to `{"anyOf": [{"type": "string"}, {"type": "null"}]}`.
+///
+/// The `{"type": "null"}` member used to fall through the converter's type switch onto its
+/// `String` fallback, turning `string | null` into `string | string`. That is the worst failure in
+/// the family: the model cannot express absence, so it invents a value, and the caller's own Zod
+/// check *passes* it — a string does satisfy `string | null`. Nothing anywhere reports an error.
+/// The model must be able to answer `null`.
+#[test]
+#[ignore = "requires the on-device Apple Intelligence model — run locally with --ignored"]
+fn nullable_field_can_come_back_null() {
+    let app = mock_app();
+    let handle = app.handle().clone();
+    if !model_ready(&handle) {
+        return;
+    }
+
+    let request = user_request(
+        "Extract the task from this note. The note names nobody at all, so there is no assignee: \
+         \"Fix the leaking tap.\"",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "task": {"type": "string"},
+                "assignee": {
+                    "description": "The person assigned, or null when the note names nobody.",
+                    "anyOf": [{"type": "string"}, {"type": "null"}],
+                },
+            },
+            "required": ["task", "assignee"],
+        }),
+    );
+
+    let Some(result) = generate_or_skip(&app, request) else {
+        return;
+    };
+    let object = result.object.expect("structured result carries an object");
+    eprintln!("nullable probe: {object}");
+
+    assert!(
+        object.get("task").and_then(|value| value.as_str()).is_some_and(|s| !s.is_empty()),
+        "the sibling field must still be filled: {object}"
+    );
+    let assignee = object.get("assignee");
+    assert!(
+        assignee.is_none_or(serde_json::Value::is_null),
+        "a nullable field with nothing to report must come back null (or absent), not a \
+         fabricated value: {object}"
+    );
+}
+
+/// JSON Schema also spells nullability as an array of types, and generators that avoid `anyOf`
+/// emit that form. `dict["type"] as? String` never matched it, so the whole node lost its type and
+/// degraded to a plain string exactly like the `anyOf` case.
+#[test]
+#[ignore = "requires the on-device Apple Intelligence model — run locally with --ignored"]
+fn array_form_nullability_is_honored() {
+    let app = mock_app();
+    let handle = app.handle().clone();
+    if !model_ready(&handle) {
+        return;
+    }
+
+    let request = user_request(
+        "Extract the ferry booking from this note. The note gives no cabin number: \
+         \"Piraeus to Chania, deck seat.\"",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "route": {"type": "string"},
+                "cabin": {
+                    "type": ["string", "null"],
+                    "description": "The cabin number, or null when the note gives none.",
+                },
+            },
+            "required": ["route", "cabin"],
+        }),
+    );
+
+    let Some(result) = generate_or_skip(&app, request) else {
+        return;
+    };
+    let object = result.object.expect("structured result carries an object");
+    eprintln!("array-form nullable probe: {object}");
+
+    assert!(
+        object.get("route").and_then(|value| value.as_str()).is_some_and(|s| !s.is_empty()),
+        "the sibling field must still be filled: {object}"
+    );
+    assert!(
+        object.get("cabin").is_none_or(serde_json::Value::is_null),
+        "an array-form nullable field with nothing to report must come back null (or absent): \
+         {object}"
+    );
+}
+
+/// The other shapes the converter used to answer with a silently coerced `String`. Each must now
+/// come back as a typed `unsupported-guide` refusal: a caller that gets one can fall back, whereas
+/// a caller handed a plausible-looking wrong object cannot tell anything went wrong.
+#[test]
+#[ignore = "requires macOS with FoundationModels — run locally with --ignored"]
+fn unexpressible_schema_shapes_are_refused_with_typed_errors() {
+    let app = mock_app();
+
+    // A schema intersection. Guided generation has no primitive for one, and picking a single
+    // branch would drop half the contract.
+    let intersection = user_request(
+        "Describe a port.",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "port": {"allOf": [{"type": "string"}, {"type": "object"}]},
+            },
+            "required": ["port"],
+        }),
+    );
+    // A `type` outside the JSON Schema vocabulary — previously generated as a plain string.
+    let unknown_type = user_request(
+        "Describe a port.",
+        serde_json::json!({
+            "type": "object",
+            "properties": {"departure": {"type": "timestamp"}},
+            "required": ["departure"],
+        }),
+    );
+
+    for (label, request) in [("allOf", intersection), ("unknown type", unknown_type)] {
+        let message = app
+            .apple_intelligence()
+            .generate(request)
+            .expect_err("an unexpressible schema must be refused")
+            .to_string();
+        assert!(
+            message.contains("unsupported-guide"),
+            "expected a typed unsupported-guide refusal for {label}, got: {message}"
+        );
+        eprintln!("{label} refusal: {message}");
+    }
+}
+
 /// A recursive schema cannot be expressed as a `GenerationSchema` at all. It must be refused up
 /// front with the typed `unsupported-guide` code — a caller that gets a typed refusal can fall back
 /// to free-text parsing; a caller that gets a plausible-looking wrong object cannot tell.

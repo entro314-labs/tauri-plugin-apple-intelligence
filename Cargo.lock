@@ -3098,7 +3098,7 @@ dependencies = [
 
 [[package]]
 name = "tauri-plugin-apple-intelligence"
-version = "0.7.1"
+version = "0.8.0"
 dependencies = [
  "serde",
  "serde_json",
