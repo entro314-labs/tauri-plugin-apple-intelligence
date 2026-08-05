@@ -372,7 +372,14 @@ export class AppleIntelligenceChatLanguageModel implements LanguageModelV4 {
       return;
     }
 
-    const availability = await this.transport.checkAvailability();
+    // Checked against the model this call will actually use. Private Cloud Compute has its own
+    // availability (it needs a restricted entitlement most apps cannot get), so checking the
+    // on-device model would clear a request that Private Cloud Compute cannot serve.
+    const availability =
+      this.resolveModel() === "private-cloud" &&
+      this.transport.checkPrivateCloudAvailability
+        ? await this.transport.checkPrivateCloudAvailability()
+        : await this.transport.checkAvailability();
     if (!availability.available) {
       throw new AppleIntelligenceGenerationError({
         code: "unavailable",

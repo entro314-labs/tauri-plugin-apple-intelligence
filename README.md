@@ -71,9 +71,9 @@ const { text } = await generateText({
 | Capability | Command | Notes |
 |---|---|---|
 | Availability (on-device) | `check_availability` | Device eligible + Apple Intelligence enabled + model ready |
-| Availability (Private Cloud Compute) | `pcc_check_availability` | macOS 27+; larger, reasoning-capable, still private (no API key/bill) |
+| Availability (Private Cloud Compute) | `pcc_check_availability` | macOS 27+, **and** only for apps holding the restricted PCC entitlement — see [Private Cloud Compute](#private-cloud-compute) |
 | Generate / stream | `generate`, `stream`, `cancel_stream` | Basic, tools, and structured modes; `model: "on-device" \| "private-cloud"`, `reasoningLevel`, sampling (`temperature` incl. `0`, `topP`, `topK`, `seed`), `toolChoice` (macOS 27), and per-message `images` |
-| Context window | `context_info` | Real `contextSize` per model (4k on-device, ~32k PCC) — stop hardcoding |
+| Context window | `context_info` | Real `contextSize` per model, read from the framework — stop hardcoding |
 | Token counting | `token_count` | Real tokenizer counts (`tokenCount(for:)`, macOS 26.4+) for budgeting prompts against `contextSize` |
 | Supported languages | `supported_languages` | Live BCP-47 tags from `SystemLanguageModel.supportedLanguages` |
 | Prewarm | `prewarm` | Lower first-token latency; optional `promptPrefix` eagerly processes a known prompt prefix |
@@ -108,9 +108,10 @@ transport talks to this plugin, and a custom transport (e.g. a future Node bridg
 
 - Streaming text generation, tool calling (multi-step orchestration via AI SDK), and structured
   output (`generateObject`/`streamObject` with a JSON schema)
-- **Model selection** — `appleAI("apple-on-device")` (fast, ~4k context) or
+- **Model selection** — `appleAI("apple-on-device")` (fast, small context) or
   `appleAI("apple-private-cloud")` (macOS 27 Private Cloud Compute, ~32k context,
-  reasoning-capable, still private: no API key, no bill)
+  reasoning-capable, still private: no API key, no bill — but see
+  [Private Cloud Compute](#private-cloud-compute): it needs an entitlement most apps cannot get)
 - **Portable reasoning** — the AI SDK's top-level `reasoning` option maps onto Apple's reasoning
   levels (`minimal`/`low` → light, `medium` → moderate, `high`/`xhigh` → deep); a
   `providerOptions["apple-intelligence"].reasoningLevel` override or the model settings'
@@ -134,14 +135,15 @@ transport talks to this plugin, and a custom transport (e.g. a future Node bridg
 
 ### Handling the context window
 
-Apple's on-device model has a 4096-token context window per request. Budget prompts up front and
+Apple's on-device model has a small per-request context window whose size depends on the OS (4096
+on macOS 26; 8192 on macOS 27.0). Read it rather than hardcoding it — budget prompts up front and
 recover from overflow, per Apple's context-window guidance:
 
 ```ts
 import { AppleIntelligenceGenerationError } from "@entro314labs/plugin-apple-intelligence";
 
 // Budget before sending (macOS 26.4+):
-const { contextSize } = await transport.getContextInfo("on-device"); // 4096
+const { contextSize } = await transport.getContextInfo("on-device"); // e.g. 8192
 const tokens = await transport.tokenCount(prompt);                    // real tokenizer count
 
 try {
@@ -157,10 +159,68 @@ try {
 }
 ```
 
+`getContextInfo` returns `-1` when the framework declines to report a window (and `tokenCount`
+returns `-1` when a count can't be determined, `-2` on an OS without the tokenizer). Treat a
+non-positive value as "unknown" rather than as a budget.
+
 Typed error codes mirror the FoundationModels error cases — `context-window-exceeded`,
 `guardrail-violation`, `refusal`, `rate-limited`, `concurrent-requests`, and more. Non-streaming
 commands reject with `{ type: "generation", code, message, contextSize?, tokenCount? }`; streams
 emit an `error` event with the same fields.
+
+## Private Cloud Compute
+
+`PrivateCloudComputeLanguageModel` requires the restricted entitlement
+`com.apple.developer.private-cloud-compute`, which Apple grants only to apps it has approved. A
+self-distributed app cannot obtain it.
+
+The framework's own `availability` answers a question about the **device**, not about the caller:
+on any eligible Mac it reports `.available` even to a process holding no entitlement, and then
+every request fails inside FoundationModels. So this plugin gates PCC on the entitlement actually
+present in the running process's code signature (read via the Security framework):
+
+- `pcc_check_availability` reports `available: false` with a reason naming the missing entitlement.
+- `context_info("private-cloud")` returns `contextSize: -1` — a model you cannot call has no
+  usable budget.
+- `prewarm("private-cloud")` is a no-op.
+- A `model: "private-cloud"` `generate`/`stream` request is refused with the typed `unavailable`
+  code **before** a session is constructed, instead of being attempted.
+
+The check is deliberately conservative: anything it cannot positively confirm counts as "no
+entitlement", so the failure mode is a false negative (PCC reported unavailable to an app that
+could have used it) rather than a green light in front of a path that cannot serve a request. It is
+also not bypassable by simply adding the key to your entitlements plist — signing with a restricted
+entitlement you have not been granted makes the system refuse to launch the process at all.
+
+Apps that *do* hold the entitlement are unaffected: the gate passes and PCC behaves as before.
+
+## Structured output (guided generation)
+
+`generateObject`/`streamObject` (and tool parameter schemas) accept a JSON Schema, which the plugin
+converts into a FoundationModels `GenerationSchema`. Supported: objects, nested objects, arrays
+(including **arrays of objects**), string/number/integer/boolean, `enum`, `anyOf`, `minItems`/
+`maxItems`, `required`, `description`, and `$ref` into `definitions` (draft-07) or `$defs`
+(2020-12).
+
+Two shapes cannot be expressed by the framework at all, and are refused up front with the typed
+`unsupported-guide` code rather than answered with a plausible-looking wrong object:
+
+- **Recursive schemas** — a definition that (directly or transitively) contains itself, or a
+  `"$ref": "#"` back at the whole document. The guide would have to be infinitely deep.
+- **Unresolvable `$ref`s** — a reference with no matching entry under `definitions`/`$defs`.
+
+```ts
+try {
+  const { object } = await generateObject({ model: appleAI("apple-on-device"), schema });
+} catch (error) {
+  if (
+    error instanceof AppleIntelligenceGenerationError &&
+    error.code === "unsupported-guide"
+  ) {
+    // Flatten the schema, or fall back to free-text generation + your own parsing.
+  }
+}
+```
 
 ## Native library
 
@@ -180,8 +240,9 @@ To rebuild the dylib from source (macOS 26+): `scripts/build.sh`.
 - ✅ macOS 26+ on Apple Silicon (on-device model, streaming, tools, structured output, sampling
   modes, typed error codes)
 - ✅ macOS 26.4+ adds `token_count` (`tokenCount(for:)`)
-- ✅ macOS 27+ adds Private Cloud Compute, reasoning levels, multimodal image input, per-call
-  token usage, native `toolChoice` enforcement, and context-size details on
+- ✅ macOS 27+ adds Private Cloud Compute (entitlement-gated — see
+  [Private Cloud Compute](#private-cloud-compute)), reasoning levels, multimodal image input,
+  per-call token usage, native `toolChoice` enforcement, and context-size details on
   `context-window-exceeded` errors — all gated behind `@available`, so the plugin still runs on
   macOS 26 with those features simply unavailable
 - ❌ Other platforms (commands reject with `UnsupportedPlatform`)
@@ -191,9 +252,14 @@ To rebuild the dylib from source (macOS 26+): `scripts/build.sh`.
 ```bash
 # Rust: unit + serialization tests
 cargo test
-# Live probes against the real model (needs Apple Intelligence enabled):
+# Live probes against the real model (needs Apple Intelligence enabled): context/token budgeting,
+# the Private Cloud Compute entitlement gate, nested array-of-object schemas, shared `$defs`
+# references, and the typed refusal for recursive schemas.
 cargo test --test native_probes -- --ignored
 cargo test --test mock_app_stream -- --ignored
+
+# Rebuild the native bridge after editing ailib/apple-ai.swift (macOS 26+):
+./scripts/build.sh
 
 # JS: build + typecheck + provider smoke tests
 pnpm build && pnpm typecheck && pnpm test

@@ -2,6 +2,7 @@ import CoreGraphics
 import Foundation
 import FoundationModels
 import ImageIO
+import Security
 
 // MARK: - C-compatible data structures
 
@@ -185,12 +186,74 @@ private func makeImageAttachment(_ input: ImageInput) -> Attachment<ImageAttachm
     return nil
 }
 
+// MARK: - Private Cloud Compute entitlement gate
+
+/// The restricted entitlement `PrivateCloudComputeLanguageModel` requires. Apple grants it only to
+/// apps it has approved; a self-distributed app cannot obtain it.
+private let PRIVATE_CLOUD_COMPUTE_ENTITLEMENT = "com.apple.developer.private-cloud-compute"
+
+/// The message every "PCC is not usable here" path reports, so the reason a host sees on
+/// `pcc_check_availability` is the same reason a `model: "private-cloud"` request is refused with.
+private let PRIVATE_CLOUD_COMPUTE_ENTITLEMENT_REASON = """
+    Private Cloud Compute is unavailable: this app's code signature does not carry the restricted \
+    "\(PRIVATE_CLOUD_COMPUTE_ENTITLEMENT)" entitlement. \
+    `PrivateCloudComputeLanguageModel.availability` reports `.available` on any eligible Mac \
+    regardless of entitlement, but every request from an unentitled process fails inside \
+    FoundationModels. Use `model: "on-device"`.
+    """
+
+/// Entitlements the running process's code signature actually carries, or `nil` when they cannot be
+/// read (unsigned binary, ad-hoc signature with no entitlements, or a Security-framework failure).
+///
+/// Read once: a process's code signature cannot change while it runs.
+private let processEntitlements: [String: Any]? = {
+    var code: SecCode?
+    guard SecCodeCopySelf(SecCSFlags(), &code) == errSecSuccess, let code else { return nil }
+    var staticCode: SecStaticCode?
+    guard SecCodeCopyStaticCode(code, SecCSFlags(), &staticCode) == errSecSuccess,
+        let staticCode
+    else { return nil }
+    var information: CFDictionary?
+    guard
+        SecCodeCopySigningInformation(
+            staticCode, SecCSFlags(rawValue: kSecCSRequirementInformation), &information)
+            == errSecSuccess,
+        let dictionary = information as? [String: Any]
+    else { return nil }
+    return dictionary[kSecCodeInfoEntitlementsDict as String] as? [String: Any]
+}()
+
+/// Whether Private Cloud Compute is usable *by this process*.
+///
+/// `PrivateCloudComputeLanguageModel().availability` answers a question about the *device*, not
+/// about the caller: on an eligible Mac it reports `.available` even when the process holds no
+/// entitlement, and every subsequent request then fails deep inside FoundationModels (observed as
+/// `LanguageModelError -1` wrapping `ModelManagerError 1046`; other reports have it aborting the
+/// host process outright). Gating on the entitlement turns that into an honest "unavailable"
+/// before a host can act on a green light.
+///
+/// The check is deliberately conservative — anything it cannot positively confirm counts as
+/// "no entitlement", so the failure mode is a false negative (PCC reported unavailable to an app
+/// that could have used it) rather than a false positive. It is also not spoofable in practice:
+/// signing an app with this restricted entitlement without Apple's authorization makes AMFI kill
+/// the process at launch (verified on macOS 27.0 26A5388g: ad-hoc signature carrying the
+/// entitlement → SIGKILL before `main`).
+private let hasPrivateCloudComputeEntitlement: Bool = {
+    guard let entitlements = processEntitlements else { return false }
+    guard let value = entitlements[PRIVATE_CLOUD_COMPUTE_ENTITLEMENT] else { return false }
+    if let flag = value as? Bool { return flag }
+    if let number = value as? NSNumber { return number.boolValue }
+    return true
+}()
+
 /// Availability of the Private Cloud Compute model (macOS 27+). Codes mirror
 /// `apple_ai_check_availability`: 1 available, -1 device-not-eligible, -3 system-not-ready,
-/// -4 requires macOS 27, -99 unknown.
+/// -4 requires macOS 27, -5 the process lacks the required entitlement, -99 unknown.
 @_cdecl("apple_ai_pcc_check_availability")
 public func appleAIPCCCheckAvailability() -> Int32 {
     guard #available(macOS 27.0, *) else { return -4 }
+    // Checked before the framework: it reports device eligibility, not caller eligibility.
+    guard hasPrivateCloudComputeEntitlement else { return -5 }
     switch PrivateCloudComputeLanguageModel().availability {
     case .available: return 1
     case .unavailable(.deviceNotEligible): return -1
@@ -203,6 +266,9 @@ public func appleAIPCCCheckAvailability() -> Int32 {
 public func appleAIPCCGetAvailabilityReason() -> UnsafeMutablePointer<CChar>? {
     guard #available(macOS 27.0, *) else {
         return strdup("Private Cloud Compute requires macOS 27 or later.")
+    }
+    guard hasPrivateCloudComputeEntitlement else {
+        return strdup(PRIVATE_CLOUD_COMPUTE_ENTITLEMENT_REASON)
     }
     switch PrivateCloudComputeLanguageModel().availability {
     case .available:
@@ -226,6 +292,8 @@ public func appleAIContextSize(model: UnsafePointer<CChar>?) -> Int32 {
         return Int32(SystemLanguageModel.default.contextSize)
     case .privateCloud:
         guard #available(macOS 27.0, *) else { return -1 }
+        // Without the entitlement the model is unusable, so its window is not a real budget.
+        guard hasPrivateCloudComputeEntitlement else { return -1 }
         let semaphore = DispatchSemaphore(value: 0)
         var result: Int32 = -1
         Task {
@@ -260,6 +328,7 @@ public func appleAIPrewarm(model: UnsafePointer<CChar>?, promptPrefix: UnsafePoi
         LanguageModelSession(model: onDeviceModel).prewarm(promptPrefix: prefix)
     case .privateCloud:
         guard #available(macOS 27.0, *) else { return }
+        guard hasPrivateCloudComputeEntitlement else { return }
         let pccModel = PrivateCloudComputeLanguageModel()
         guard case .available = pccModel.availability else { return }
         LanguageModelSession(model: pccModel).prewarm(promptPrefix: prefix)
@@ -307,16 +376,22 @@ private func makeOnDeviceModel() -> SystemLanguageModel {
     SystemLanguageModel(guardrails: Guardrails.developerProvided)
 }
 
-/// Build a session backed by the requested model. Private Cloud Compute is used only on macOS 27+;
-/// otherwise (and for on-device) the on-device model from `makeOnDeviceModel()` is used. Both models
-/// conform to `LanguageModel`, so the tools + transcript flow is identical.
+/// Build a session backed by the requested model. Private Cloud Compute is used only on macOS 27+
+/// *and* only when this process holds the required entitlement — an unentitled `private-cloud`
+/// request throws rather than constructing a model that cannot serve it. On macOS 26, where PCC
+/// does not exist at all, a `private-cloud` request still falls back to the on-device model.
+/// Both models conform to `LanguageModel`, so the tools + transcript flow is identical.
 @available(macOS 26.0, *)
 private func makeSession(
     modelKind: ModelKind,
     tools: [any Tool],
     transcript: Transcript
-) -> LanguageModelSession {
+) throws -> LanguageModelSession {
     if case .privateCloud = modelKind, #available(macOS 27.0, *) {
+        guard hasPrivateCloudComputeEntitlement else {
+            throw ConversationError.privateCloudUnavailable(
+                PRIVATE_CLOUD_COMPUTE_ENTITLEMENT_REASON)
+        }
         return LanguageModelSession(
             model: PrivateCloudComputeLanguageModel(), tools: tools, transcript: transcript)
     }
@@ -556,8 +631,12 @@ private func mapConversationError(_ error: ConversationError) -> BridgeError {
     case .intelligenceUnavailable(let reason):
         return BridgeError(
             code: "unavailable", message: "Apple Intelligence not available - \(reason)")
+    case .privateCloudUnavailable(let reason):
+        return BridgeError(code: "unavailable", message: reason)
     case .invalidJSON(let reason):
         return BridgeError(code: "invalid-json", message: reason)
+    case .unsupportedSchema(let reason):
+        return BridgeError(code: "unsupported-guide", message: reason)
     case .noMessages:
         return BridgeError(code: "no-messages", message: "No messages provided")
     }
@@ -623,7 +702,12 @@ private struct ConversationContext {
 
 private enum ConversationError: Error {
     case intelligenceUnavailable(String)
+    /// A `model: "private-cloud"` request this process cannot serve (no entitlement).
+    case privateCloudUnavailable(String)
     case invalidJSON(String)
+    /// A JSON Schema whose shape Apple's guided generation cannot express. Refused up front so the
+    /// caller can fall back, instead of being answered with a confidently wrong object.
+    case unsupportedSchema(String)
     case noMessages
 }
 
@@ -1308,45 +1392,160 @@ private struct AnyCodable: Codable {
     import FoundationModels
 #endif
 
-@available(macOS 26.0, *)
-private func convertJSONSchemaToDynamic(_ dict: [String: Any], name: String? = nil)
-    -> DynamicGenerationSchema
-{
-    // Handle references (not fully implemented)
-    if let ref = dict["$ref"] as? String {
-        return .init(referenceTo: ref)
+/// Hands out a unique type name for every named schema inside one `GenerationSchema`.
+///
+/// Names are not decoration. `GenerationSchema` keys its `$defs` by them, and a nested schema whose
+/// name is already taken is emitted as a `$ref` to the schema that claimed it first. That is what
+/// broke arrays of objects: an untitled root object was named `"Object"`, the array's item object
+/// was *also* named `"Object"`, and the guide handed to the model became
+/// `{"title":"Object", …, "items":{"$ref":"#"}}` — the root referring to itself. The model then
+/// dutifully nested the whole top-level object inside its own array, several levels deep, leaving
+/// the sibling fields empty. Unique names keep every sub-schema separately addressable.
+private final class SchemaNameAllocator {
+    private var used: Set<String> = []
+
+    /// A unique name close to `preferred` (suffixed with `2`, `3`, … on collision).
+    func allocate(preferred: String) -> String {
+        let base = SchemaNameAllocator.sanitize(preferred)
+        if used.insert(base).inserted { return base }
+        var suffix = 2
+        while !used.insert("\(base)\(suffix)").inserted { suffix += 1 }
+        return "\(base)\(suffix)"
     }
+
+    /// Strip characters that have no business in a type name the guide exposes to the model.
+    private static func sanitize(_ raw: String) -> String {
+        let cleaned = String(raw.filter { $0.isLetter || $0.isNumber || $0 == "_" })
+        return cleaned.isEmpty ? "Value" : cleaned
+    }
+}
+
+/// The definition key a `$ref` points at: the last path component, so `#/definitions/Person`,
+/// `#/$defs/Person` and a bare `Person` all resolve to `Person`. `#` (the whole document) has no
+/// key and is rejected by validation as a recursive reference.
+private func schemaReferenceKey(_ ref: String) -> String {
+    ref.split(separator: "/").last.map(String.init) ?? ""
+}
+
+/// Every named sub-schema a document defines, from `definitions` (draft-07) and `$defs` (2020-12,
+/// what zod v4 and the AI SDK emit). `$defs` wins on a key collision, being the newer spelling.
+private func collectSchemaDefinitions(_ json: [String: Any]) -> [String: [String: Any]] {
+    var definitions: [String: [String: Any]] = [:]
+    for key in ["definitions", "$defs"] {
+        guard let group = json[key] as? [String: Any] else { continue }
+        for (name, value) in group {
+            if let dict = value as? [String: Any] { definitions[name] = dict }
+        }
+    }
+    return definitions
+}
+
+/// Walk a schema node and refuse the shapes guided generation cannot express, so the caller gets a
+/// typed `unsupported-guide` refusal it can fall back from — rather than a plausible-looking object
+/// that is quietly wrong.
+///
+/// `stack` carries the definitions currently being expanded, which is how a reference cycle
+/// (`Node → children → Node`) is detected: `GenerationSchema` has no way to express a type that
+/// contains itself, since the guide would have to be infinitely deep.
+@available(macOS 26.0, *)
+private func assertSchemaNodeIsExpressible(
+    _ node: Any,
+    definitions: [String: [String: Any]],
+    stack: inout [String]
+) throws {
+    guard let dict = node as? [String: Any] else { return }
+
+    if let ref = dict["$ref"] as? String {
+        let key = schemaReferenceKey(ref)
+        if ref == "#" || key.isEmpty {
+            throw ConversationError.unsupportedSchema(
+                "Schema reference '\(ref)' points at the whole document: this schema is recursive, "
+                    + "and Apple's guided generation cannot express a type that contains itself.")
+        }
+        guard let target = definitions[key] else {
+            throw ConversationError.unsupportedSchema(
+                "Schema reference '\(ref)' could not be resolved; define '\(key)' under "
+                    + "'definitions' or '$defs' in the same schema document.")
+        }
+        if stack.contains(key) {
+            throw ConversationError.unsupportedSchema(
+                "Schema definition '\(key)' is recursive; Apple's guided generation cannot express "
+                    + "a type that contains itself.")
+        }
+        stack.append(key)
+        try assertSchemaNodeIsExpressible(target, definitions: definitions, stack: &stack)
+        stack.removeLast()
+        return
+    }
+
+    if let properties = dict["properties"] as? [String: Any] {
+        for (_, value) in properties {
+            try assertSchemaNodeIsExpressible(value, definitions: definitions, stack: &stack)
+        }
+    }
+    if let items = dict["items"] {
+        try assertSchemaNodeIsExpressible(items, definitions: definitions, stack: &stack)
+    }
+    if let anyOf = dict["anyOf"] as? [Any] {
+        for choice in anyOf {
+            try assertSchemaNodeIsExpressible(choice, definitions: definitions, stack: &stack)
+        }
+    }
+}
+
+/// Convert one JSON Schema node into a `DynamicGenerationSchema`.
+///
+/// `assignedName` is the already-allocated name for this node (used for the entries of
+/// `definitions`/`$defs`, whose names must match what `$ref`s resolve to); everything else passes
+/// `preferredName` and gets a unique variant of it from `allocator`.
+@available(macOS 26.0, *)
+private func convertJSONSchemaToDynamic(
+    _ dict: [String: Any],
+    preferredName: String,
+    assignedName: String? = nil,
+    allocator: SchemaNameAllocator,
+    referenceNames: [String: String]
+) -> DynamicGenerationSchema {
+    // Resolved to the *allocated* name of the referenced definition — `referenceTo:` takes a schema
+    // name, not a JSON pointer, so passing the raw `#/definitions/X` never matched anything.
+    if let ref = dict["$ref"] as? String {
+        let key = schemaReferenceKey(ref)
+        return .init(referenceTo: referenceNames[key] ?? key)
+    }
+
+    let description = dict["description"] as? String
+    func name() -> String { assignedName ?? allocator.allocate(preferred: preferredName) }
 
     if let anyOf = dict["anyOf"] as? [[String: Any]] {
         // Detect simple string enum union
         var stringChoices: [String] = []
         var dynamicChoices: [DynamicGenerationSchema] = []
-        for choice in anyOf {
+        for (index, choice) in anyOf.enumerated() {
             if let enums = choice["enum"] as? [String], enums.count == 1 {
                 stringChoices.append(enums[0])
             } else {
-                dynamicChoices.append(convertJSONSchemaToDynamic(choice))
+                dynamicChoices.append(
+                    convertJSONSchemaToDynamic(
+                        choice, preferredName: "\(preferredName)Choice\(index + 1)",
+                        allocator: allocator, referenceNames: referenceNames))
             }
         }
         if !stringChoices.isEmpty && dynamicChoices.isEmpty {
-            return .init(
-                name: name ?? UUID().uuidString, description: dict["description"] as? String,
-                anyOf: stringChoices)
-        } else {
-            let choices =
-                dynamicChoices.isEmpty
-                ? anyOf.map { convertJSONSchemaToDynamic($0) } : dynamicChoices
-            return .init(
-                name: name ?? UUID().uuidString, description: dict["description"] as? String,
-                anyOf: choices)
+            return .init(name: name(), description: description, anyOf: stringChoices)
         }
+        let choices =
+            dynamicChoices.isEmpty
+            ? anyOf.enumerated().map { index, choice in
+                convertJSONSchemaToDynamic(
+                    choice, preferredName: "\(preferredName)Choice\(index + 1)",
+                    allocator: allocator, referenceNames: referenceNames)
+            } : dynamicChoices
+        return .init(name: name(), description: description, anyOf: choices)
     }
 
     // Enum handling
     if let enums = dict["enum"] as? [String] {
-        return .init(
-            name: name ?? UUID().uuidString, description: dict["description"] as? String,
-            anyOf: enums)
+        return .init(name: name(), description: description, anyOf: enums)
     }
 
     guard let type = dict["type"] as? String else {
@@ -1365,7 +1564,9 @@ private func convertJSONSchemaToDynamic(_ dict: [String: Any], name: String? = n
         return .init(type: Bool.self)
     case "array":
         if let items = dict["items"] as? [String: Any] {
-            let itemSchema = convertJSONSchemaToDynamic(items)
+            let itemSchema = convertJSONSchemaToDynamic(
+                items, preferredName: "\(preferredName)Item", allocator: allocator,
+                referenceNames: referenceNames)
             let min = dict["minItems"] as? Int
             let max = dict["maxItems"] as? Int
             return .init(arrayOf: itemSchema, minimumElements: min, maximumElements: max)
@@ -1374,12 +1575,17 @@ private func convertJSONSchemaToDynamic(_ dict: [String: Any], name: String? = n
             return .init(arrayOf: .init(type: String.self))
         }
     case "object":
+        // Claimed before the children are converted, so a nested schema can never take this name
+        // and turn a child into a `$ref` back at its own ancestor.
+        let objectName = name()
         let required = (dict["required"] as? [String]) ?? []
         var props: [DynamicGenerationSchema.Property] = []
         if let properties = dict["properties"] as? [String: Any] {
             for (propName, subSchemaAny) in properties {
                 guard let subSchemaDict = subSchemaAny as? [String: Any] else { continue }
-                let subSchema = convertJSONSchemaToDynamic(subSchemaDict, name: propName)
+                let subSchema = convertJSONSchemaToDynamic(
+                    subSchemaDict, preferredName: propName, allocator: allocator,
+                    referenceNames: referenceNames)
                 let isOptional = !required.contains(propName)
                 let prop = DynamicGenerationSchema.Property(
                     name: propName, description: subSchemaDict["description"] as? String,
@@ -1387,8 +1593,7 @@ private func convertJSONSchemaToDynamic(_ dict: [String: Any], name: String? = n
                 props.append(prop)
             }
         }
-        return .init(
-            name: name ?? "Object", description: dict["description"] as? String, properties: props)
+        return .init(name: objectName, description: description, properties: props)
     default:
         return .init(type: String.self)
     }
@@ -1424,39 +1629,52 @@ private func generatedContentToJSON(_ content: GeneratedContent) -> Any {
     }
 }
 
+/// Build the root schema plus its dependencies from a JSON Schema document.
+///
+/// Throws `ConversationError.unsupportedSchema` for shapes guided generation cannot express
+/// (unresolvable or recursive `$ref`s) rather than letting them degrade into a wrong-but-confident
+/// guide.
 @available(macOS 26.0, *)
-private func buildSchemasFromJson(_ json: [String: Any]) -> (
+private func buildSchemasFromJson(_ json: [String: Any]) throws -> (
     DynamicGenerationSchema, [DynamicGenerationSchema]
 ) {
-    var dependencies: [DynamicGenerationSchema] = []
-    var rootNameFromRef: String? = nil
-    if let ref = json["$ref"] as? String, ref.hasPrefix("#/definitions/") {
-        rootNameFromRef = String(ref.dropFirst("#/definitions/".count))
+    let definitions = collectSchemaDefinitions(json)
+    var stack: [String] = []
+    try assertSchemaNodeIsExpressible(json, definitions: definitions, stack: &stack)
+
+    var rootDefinitionKey: String? = nil
+    if let ref = json["$ref"] as? String {
+        let key = schemaReferenceKey(ref)
+        if definitions[key] != nil { rootDefinitionKey = key }
     }
 
-    if let defs = json["definitions"] as? [String: Any] {
-        for (name, subAny) in defs {
-            if let subDict = subAny as? [String: Any] {
-                if let rootNameFromRef, name == rootNameFromRef { continue }
-                let depSchema = convertJSONSchemaToDynamic(subDict, name: name)
-                dependencies.append(depSchema)
-            }
-        }
+    // Definition names are allocated first and in a stable order, so `$ref`s resolve to the same
+    // names the dependencies were registered under no matter where they appear in the tree.
+    let allocator = SchemaNameAllocator()
+    let definitionKeys = definitions.keys.sorted().filter { $0 != rootDefinitionKey }
+    var referenceNames: [String: String] = [:]
+    for key in definitionKeys {
+        referenceNames[key] = allocator.allocate(preferred: key)
+    }
+
+    let dependencies = definitionKeys.map { key in
+        convertJSONSchemaToDynamic(
+            definitions[key]!, preferredName: key, assignedName: referenceNames[key],
+            allocator: allocator, referenceNames: referenceNames)
     }
 
     // Determine root schema
-    if let rootNameFromRef = rootNameFromRef {
-        let name = rootNameFromRef
-        if let defs = json["definitions"] as? [String: Any],
-            let rootDef = defs[name] as? [String: Any]
-        {
-            let rootSchema = convertJSONSchemaToDynamic(rootDef, name: name)
-            return (rootSchema, dependencies)
-        }
+    if let rootDefinitionKey, let rootDef = definitions[rootDefinitionKey] {
+        let root = convertJSONSchemaToDynamic(
+            rootDef, preferredName: rootDefinitionKey, allocator: allocator,
+            referenceNames: referenceNames)
+        return (root, dependencies)
     }
 
     // Fallback
-    let root = convertJSONSchemaToDynamic(json, name: json["title"] as? String)
+    let root = convertJSONSchemaToDynamic(
+        json, preferredName: json["title"] as? String ?? "Object", allocator: allocator,
+        referenceNames: referenceNames)
     return (root, dependencies)
 }
 
@@ -1770,7 +1988,7 @@ private func makeTextStream(
 private func handleBasicMode(context: ConversationContext) async throws -> String {
     let transcript = Transcript(entries: context.transcriptEntries)
     debugPrintTranscript(transcript, prompt: context.currentPrompt)
-    let session = makeSession(modelKind: context.modelKind, tools: [], transcript: transcript)
+    let session = try makeSession(modelKind: context.modelKind, tools: [], transcript: transcript)
     let (text, usage) = try await respondText(session: session, context: context)
 
     // Return as JSON for consistency
@@ -1787,7 +2005,7 @@ private func handleBasicModeStream(
 ) async throws {
     let transcript = Transcript(entries: context.transcriptEntries)
     debugPrintTranscript(transcript, prompt: context.currentPrompt)
-    let session = makeSession(modelKind: context.modelKind, tools: [], transcript: transcript)
+    let session = try makeSession(modelKind: context.modelKind, tools: [], transcript: transcript)
 
     var prev = ""
     for try await cumulative in makeTextStream(session: session, context: context) {
@@ -1821,13 +2039,13 @@ private func handleStructuredMode(
     }
 
     // Build schema from JSON
-    let (rootSchema, deps) = buildSchemasFromJson(jsonObj)
+    let (rootSchema, deps) = try buildSchemasFromJson(jsonObj)
     let generationSchema = try GenerationSchema(root: rootSchema, dependencies: deps)
 
     // Create session without tools (structured generation doesn't use tools constructor)
     let transcript = Transcript(entries: context.transcriptEntries)
     debugPrintTranscript(transcript, prompt: context.currentPrompt)
-    let session = makeSession(modelKind: context.modelKind, tools: [], transcript: transcript)
+    let session = try makeSession(modelKind: context.modelKind, tools: [], transcript: transcript)
 
     // Generate structured response
     let response = try await session.respond(
@@ -1875,7 +2093,7 @@ private func handleToolsMode(
         else { continue }
         let description = dict["description"] as? String ?? ""
         let paramsSchemaJson = dict["parameters"] as? [String: Any] ?? [:]
-        let (root, deps) = buildSchemasFromJson(paramsSchemaJson)
+        let (root, deps) = try buildSchemasFromJson(paramsSchemaJson)
         let genSchema = try GenerationSchema(root: root, dependencies: deps)
         let proxy = JSProxyTool(
             toolID: idNum, name: name, description: description, parametersSchema: genSchema
@@ -1920,7 +2138,7 @@ private func handleToolsMode(
 
     let transcript = Transcript(entries: finalEntries)
     debugPrintTranscript(transcript, prompt: context.currentPrompt)
-    let session = makeSession(modelKind: context.modelKind, tools: tools, transcript: transcript)
+    let session = try makeSession(modelKind: context.modelKind, tools: tools, transcript: transcript)
 
     // Reset tool call collection
     ToolCallCollector.shared.reset()

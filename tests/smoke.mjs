@@ -242,4 +242,32 @@ function makeTransport(overrides = {}) {
   console.log("9 toAppleIntelligenceError normalization OK");
 }
 
+// 10. Availability is checked against the model the call will actually use: Private Cloud Compute
+// has its own availability (it needs a restricted entitlement), so an unavailable PCC must not be
+// cleared by an available on-device model.
+{
+  const transport = makeTransport();
+  transport.checkPrivateCloudAvailability = async () => ({
+    available: false,
+    reason: "missing the private-cloud-compute entitlement",
+  });
+  const provider = createAppleIntelligenceProvider({ transport });
+
+  await assert.rejects(
+    generateText({ model: provider("apple-private-cloud"), prompt: "hi" }),
+    (error) => {
+      const cause = error instanceof AppleIntelligenceGenerationError ? error : error.cause;
+      assert.ok(cause instanceof AppleIntelligenceGenerationError, `typed error, got ${error}`);
+      assert.equal(cause.code, "unavailable");
+      assert.match(cause.message, /entitlement/);
+      return true;
+    }
+  );
+
+  // The on-device model is unaffected.
+  const onDevice = await generateText({ model: provider("apple-on-device"), prompt: "hi" });
+  assert.equal(onDevice.text, "Hello from Apple Intelligence");
+  console.log("10 private-cloud availability is checked per model OK");
+}
+
 console.log("\nAll smoke tests passed.");
