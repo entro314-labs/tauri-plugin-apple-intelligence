@@ -8,7 +8,7 @@
 use tauri::{AppHandle, test::MockRuntime};
 use tauri_plugin_apple_intelligence::{
     AppleAIError, AppleAIGenerateRequest, AppleAIGenerateResult, AppleAIMessage,
-    AppleIntelligenceExt,
+    AppleAIToolDefinition, AppleIntelligenceExt,
 };
 
 fn mock_app() -> tauri::App<MockRuntime> {
@@ -841,4 +841,305 @@ fn recursive_schema_is_refused_with_a_typed_error() {
         "expected a typed unsupported-guide refusal, got: {message}"
     );
     eprintln!("recursive schema refusal: {message}");
+}
+
+/// anasa's `create_note` tool parameters, exactly as the AI SDK hands them over (zod v4 →
+/// draft-7, `io: 'input'`, then the SDK's `additionalProperties: false` pass). `frontmatter` and
+/// `metadata` are `z.record(z.string(), z.unknown()).default({})`, which survives that pass as an
+/// open map spelled `propertyNames` — and neither is `required`.
+fn anasa_create_note_schema() -> serde_json::Value {
+    serde_json::json!({
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "properties": {
+            "title": {"type": "string", "minLength": 1},
+            "content": {"default": "", "type": "string"},
+            "folder": {"type": "string", "minLength": 1},
+            "path": {"type": "string", "minLength": 1},
+            "tags": {"default": [], "type": "array", "items": {"type": "string", "minLength": 1}},
+            "frontmatter": {
+                "default": {},
+                "type": "object",
+                "propertyNames": {"type": "string"},
+                "additionalProperties": false,
+            },
+            "metadata": {
+                "default": {},
+                "type": "object",
+                "propertyNames": {"type": "string"},
+                "additionalProperties": false,
+            },
+        },
+        "required": ["title"],
+        "additionalProperties": false,
+    })
+}
+
+/// anasa's `update_note` tool parameters: the same two records, one level down inside a `required`
+/// object. The nesting is the point — `updates` *is* required, so the decision has to be made per
+/// property at the level that declares it, not for the whole subtree.
+fn anasa_update_note_schema() -> serde_json::Value {
+    serde_json::json!({
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "properties": {
+            "noteId": {"type": "string", "minLength": 1},
+            "updates": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string", "minLength": 1},
+                    "content": {"type": "string"},
+                    "path": {"type": "string", "minLength": 1},
+                    "tags": {"type": "array", "items": {"type": "string", "minLength": 1}},
+                    "frontmatter": {
+                        "type": "object",
+                        "propertyNames": {"type": "string"},
+                        "additionalProperties": false,
+                    },
+                    "metadata": {
+                        "type": "object",
+                        "propertyNames": {"type": "string"},
+                        "additionalProperties": false,
+                    },
+                    "state": {
+                        "type": "string",
+                        "enum": ["draft", "active", "archived", "deprecated"],
+                    },
+                },
+                "additionalProperties": false,
+            },
+        },
+        "required": ["noteId", "updates"],
+        "additionalProperties": false,
+    })
+}
+
+/// A request that offers the model a tool set, the way a tool-calling host does.
+fn tool_request(prompt: &str, tools: Vec<AppleAIToolDefinition>) -> AppleAIGenerateRequest {
+    AppleAIGenerateRequest {
+        tools: Some(tools),
+        schema: None,
+        ..user_request(prompt, serde_json::json!({}))
+    }
+}
+
+/// A property whose shape guided generation cannot express, sitting on a property the schema does
+/// **not** require, must not take the whole schema down with it. 0.9.0 refused the entire document,
+/// which stopped real tool sets working over one field nothing could ever have filled
+/// (`z.record(...).optional()` in a note-editing tool). It is dropped from the guide instead — a
+/// narrowing the caller's own validator still accepts, because the property was optional — and the
+/// drop is reported so it is never silent.
+#[test]
+#[ignore = "requires the on-device Apple Intelligence model — run locally with --ignored"]
+fn optional_unexpressible_properties_are_omitted_and_reported() {
+    let app = mock_app();
+    let handle = app.handle().clone();
+    if !model_ready(&handle) {
+        return;
+    }
+
+    let request = user_request(
+        "Write a note titled \"Ferry Log\" about the Piraeus to Chania crossing.",
+        anasa_create_note_schema(),
+    );
+    let Some(result) = generate_or_skip(&app, request) else {
+        return;
+    };
+    let object = result.object.expect("structured result carries an object");
+    eprintln!("optional-omission probe: {object}");
+
+    assert!(
+        object.get("title").and_then(|value| value.as_str()).is_some_and(|s| !s.is_empty()),
+        "the expressible properties must still be generated: {object}"
+    );
+    for dropped in ["frontmatter", "metadata"] {
+        assert!(
+            object.get(dropped).is_none(),
+            "'{dropped}' was dropped from the guide, so it cannot come back: {object}"
+        );
+    }
+
+    let warnings = result.schema_warnings.expect("the omissions must be reported");
+    let report = warnings.join("\n");
+    eprintln!("optional-omission warnings:\n{report}");
+    for dropped in ["frontmatter", "metadata"] {
+        assert!(
+            report.contains(dropped),
+            "the report must name every dropped property, missing '{dropped}': {report}"
+        );
+    }
+    assert!(
+        report.contains("open map"),
+        "the report must say why the property was dropped: {report}"
+    );
+}
+
+/// The same shape reaching the converter as a *tool* schema, which is how anasa hits it: the tool
+/// has to stay callable, and the dropped properties have to be attributed to it by name.
+#[test]
+#[ignore = "requires the on-device Apple Intelligence model — run locally with --ignored"]
+fn tool_schemas_keep_working_when_an_optional_property_is_unexpressible() {
+    let app = mock_app();
+    let handle = app.handle().clone();
+    if !model_ready(&handle) {
+        return;
+    }
+
+    let request = tool_request(
+        "Rename the note with id note-42 to \"Aegean Crossings\". Use the update_note tool.",
+        vec![AppleAIToolDefinition {
+            name: "update_note".to_string(),
+            description: Some("Update note metadata or content".to_string()),
+            parameters: anasa_update_note_schema(),
+        }],
+    );
+
+    let Some(result) = generate_or_skip(&app, request) else {
+        return;
+    };
+    eprintln!(
+        "tool-omission probe: text={:?} calls={:?}",
+        result.text, result.tool_calls
+    );
+
+    let warnings = result.schema_warnings.expect("the omissions must be reported");
+    let report = warnings.join("\n");
+    eprintln!("tool-omission warnings:\n{report}");
+    assert!(
+        report.contains("update_note"),
+        "the report must name the tool the property belongs to: {report}"
+    );
+    for dropped in ["updates.frontmatter", "updates.metadata"] {
+        assert!(
+            report.contains(dropped),
+            "the report must name the dropped property by path, missing '{dropped}': {report}"
+        );
+    }
+}
+
+/// The other half of the rule: the *same* unexpressible shapes on a property the schema requires
+/// stay a typed refusal. The contract cannot be satisfied — dropping a required property would
+/// leave the model unable to produce a valid answer at all — so the caller has to be told, by name.
+#[test]
+#[ignore = "requires macOS with FoundationModels — run locally with --ignored"]
+fn required_unexpressible_properties_are_still_refused() {
+    let app = mock_app();
+
+    let shapes = [
+        (
+            "open map",
+            serde_json::json!({"type": "object", "additionalProperties": {"type": "string"}}),
+        ),
+        (
+            "heterogeneous tuple",
+            serde_json::json!({
+                "type": "array",
+                "prefixItems": [{"type": "string"}, {"type": "number"}],
+            }),
+        ),
+        (
+            "multi-member allOf",
+            serde_json::json!({"allOf": [{"type": "string"}, {"type": "object"}]}),
+        ),
+        (
+            "boolean literal",
+            serde_json::json!({"type": "boolean", "const": true}),
+        ),
+        (
+            "unknown type",
+            serde_json::json!({"type": "timestamp"}),
+        ),
+        (
+            // Every property of this object is unexpressible, and none of them is required — so the
+            // guide for it would carry no fields at all, which is the empty-object failure the
+            // open-map refusal exists to prevent. It is refused in turn, and its *owner* applies
+            // the same rule to it: required here, so the whole schema is refused.
+            "object whose every property is dropped",
+            serde_json::json!({
+                "type": "object",
+                "properties": {"labels": {"type": "object", "additionalProperties": true}},
+            }),
+        ),
+    ];
+
+    for (label, shape) in shapes {
+        let required = user_request(
+            "Describe the crossing.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {"note": {"type": "string"}, "field": shape},
+                "required": ["note", "field"],
+            }),
+        );
+        let message = app
+            .apple_intelligence()
+            .generate(required)
+            .expect_err("a required property that cannot be expressed must be refused")
+            .to_string();
+        assert!(
+            message.contains("unsupported-guide"),
+            "expected a typed unsupported-guide refusal for a required {label}, got: {message}"
+        );
+        assert!(
+            message.contains("field"),
+            "the refusal must name the offending property for {label}, got: {message}"
+        );
+        eprintln!("required {label} refusal: {message}");
+    }
+}
+
+/// The optional counterpart of the shapes above, in one schema: each is dropped, generation still
+/// happens for the rest, and every drop is named in the report. (Kept together so one generation
+/// covers the whole table.)
+#[test]
+#[ignore = "requires the on-device Apple Intelligence model — run locally with --ignored"]
+fn every_unexpressible_shape_is_droppable_when_optional() {
+    let app = mock_app();
+    let handle = app.handle().clone();
+    if !model_ready(&handle) {
+        return;
+    }
+
+    let request = user_request(
+        "The ferry Blue Star sails from Piraeus. Name the ship.",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "ship": {"type": "string"},
+                "openMap": {"type": "object", "additionalProperties": {"type": "string"}},
+                "tuple": {
+                    "type": "array",
+                    "prefixItems": [{"type": "string"}, {"type": "number"}],
+                },
+                "intersection": {"allOf": [{"type": "string"}, {"type": "object"}]},
+                "booleanLiteral": {"type": "boolean", "const": true},
+                "unknownType": {"type": "timestamp"},
+            },
+            "required": ["ship"],
+        }),
+    );
+
+    let Some(result) = generate_or_skip(&app, request) else {
+        return;
+    };
+    let object = result.object.expect("structured result carries an object");
+    eprintln!("droppable-shapes probe: {object}");
+    assert!(
+        object.get("ship").and_then(|value| value.as_str()).is_some_and(|s| !s.is_empty()),
+        "the expressible property must still be generated: {object}"
+    );
+
+    let warnings = result.schema_warnings.expect("the omissions must be reported");
+    let report = warnings.join("\n");
+    eprintln!("droppable-shapes warnings:\n{report}");
+    for dropped in ["openMap", "tuple", "intersection", "booleanLiteral", "unknownType"] {
+        assert!(
+            report.contains(dropped),
+            "every dropped property must be named, missing '{dropped}': {report}"
+        );
+        assert!(
+            object.get(dropped).is_none(),
+            "a dropped property cannot come back: {object}"
+        );
+    }
 }

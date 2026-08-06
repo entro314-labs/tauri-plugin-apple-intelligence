@@ -264,12 +264,18 @@ mod macos {
             .and_then(|value| serde_json::from_value(value).ok());
         let object = parsed.get("object").cloned();
         let usage = parsed.get("usage").and_then(parse_usage);
+        let schema_warnings = parsed
+            .get("schemaWarnings")
+            .cloned()
+            .and_then(|value| serde_json::from_value::<Vec<String>>(value).ok())
+            .filter(|warnings| !warnings.is_empty());
 
         Ok(AppleAIGenerateResult {
             text,
             tool_calls,
             object,
             usage,
+            schema_warnings,
         })
     }
 
@@ -579,6 +585,7 @@ mod macos {
     const ERROR_SENTINEL: u8 = 0x02;
     const REASONING_SENTINEL: u8 = 0x03;
     const USAGE_SENTINEL: u8 = 0x04;
+    const WARNING_SENTINEL: u8 = 0x05;
 
     extern "C" fn stream_chunk_callback(ptr: *const std::os::raw::c_char) {
         let state_mutex = STREAM_STATE.get_or_init(|| Mutex::new(None));
@@ -642,6 +649,13 @@ mod macos {
             Some(&REASONING_SENTINEL) => {
                 let text = String::from_utf8_lossy(&bytes[1..]).into_owned();
                 emit_event(state, AppleAIStreamEvent::Reasoning { text });
+                return;
+            }
+            Some(&WARNING_SENTINEL) => {
+                // Non-fatal: the stream continues. Carries the properties a tool's schema declared
+                // that its guide could not express, ahead of the first answer token.
+                let message = String::from_utf8_lossy(&bytes[1..]).into_owned();
+                emit_event(state, AppleAIStreamEvent::Warning { message });
                 return;
             }
             _ => {}

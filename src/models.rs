@@ -103,6 +103,13 @@ pub struct AppleAIGenerateResult {
     pub object: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<AppleAIUsage>,
+    /// Properties a schema declared that the generated guide could not carry: shapes Apple's guided
+    /// generation cannot express, sitting on properties the schema does not `required`. They are
+    /// dropped so the rest of the schema still works (a required one is refused outright with
+    /// `unsupported-guide` instead), and reported here so the drop is never silent — the TS provider
+    /// turns each entry into an AI SDK call warning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_warnings: Option<Vec<String>>,
 }
 
 /// Context-window info for a model. `context_size` is the max token count; `-1` when it cannot be
@@ -147,6 +154,11 @@ pub enum AppleAIStreamEvent {
     },
     #[serde(rename = "usage")]
     Usage { usage: AppleAIUsage },
+    /// A non-fatal notice about the request; generation continues. Currently carries the properties
+    /// a tool's schema declared but its guide could not express (see
+    /// [`AppleAIGenerateResult::schema_warnings`]). Emitted before the first text delta.
+    #[serde(rename = "warning")]
+    Warning { message: String },
     #[serde(rename = "done")]
     Done,
     /// A typed generation failure. `code` is a stable machine-readable code (e.g.

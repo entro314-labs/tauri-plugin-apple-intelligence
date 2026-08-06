@@ -116,6 +116,27 @@ function convertUsage(usage?: AppleIntelligenceUsage): LanguageModelV4Usage {
   };
 }
 
+/**
+ * Fold the native schema-omission reports into the call's warnings.
+ *
+ * A property whose shape Apple's guided generation cannot express is dropped from the guide when
+ * the schema does not require it — the tool keeps working, minus a field nothing could have filled.
+ * Surfacing it here is what keeps that from being a silent degradation: it shows up wherever the
+ * AI SDK surfaces warnings (`result.warnings`, and the console warning the SDK logs by default).
+ */
+function withSchemaWarnings(
+  warnings: SharedV4Warning[],
+  messages: string[] | undefined
+): SharedV4Warning[] {
+  if (!messages?.length) {
+    return warnings;
+  }
+  return [
+    ...warnings,
+    ...messages.map((message) => ({ type: "other" as const, message })),
+  ];
+}
+
 const STOP_FINISH: LanguageModelV4FinishReason = {
   unified: "stop",
   raw: "stop",
@@ -514,7 +535,7 @@ export class AppleIntelligenceChatLanguageModel implements LanguageModelV4 {
       content: [{ type: "text", text }],
       finishReason: STOP_FINISH,
       usage: convertUsage(result.usage),
-      warnings: call.warnings,
+      warnings: withSchemaWarnings(call.warnings, result.schemaWarnings),
     };
   }
 
@@ -554,7 +575,7 @@ export class AppleIntelligenceChatLanguageModel implements LanguageModelV4 {
         content: toolCallContent,
         finishReason: TOOL_CALLS_FINISH,
         usage: convertUsage(result.usage),
-        warnings: call.warnings,
+        warnings: withSchemaWarnings(call.warnings, result.schemaWarnings),
       };
     }
 
@@ -562,7 +583,7 @@ export class AppleIntelligenceChatLanguageModel implements LanguageModelV4 {
       content: [{ type: "text", text: result.text ?? "" }],
       finishReason: STOP_FINISH,
       usage: convertUsage(result.usage),
-      warnings: call.warnings,
+      warnings: withSchemaWarnings(call.warnings, result.schemaWarnings),
     };
   }
 
@@ -812,9 +833,11 @@ export class AppleIntelligenceChatLanguageModel implements LanguageModelV4 {
     const newId = this.generateId;
     return new ReadableStream<LanguageModelV4StreamPart>({
       async start(controller) {
-        controller.enqueue({ type: "stream-start", warnings: call.warnings });
         try {
+          // `stream-start` is the only part that carries warnings, so it waits for the result —
+          // the guide's dropped properties are only known once the native call has built it.
           const result = await generate();
+          controller.enqueue({ type: "stream-start", warnings: result.warnings });
           const textId = newId();
           for (const part of result.content) {
             if (part.type === "text" && part.text.length > 0) {
@@ -853,13 +876,26 @@ export class AppleIntelligenceChatLanguageModel implements LanguageModelV4 {
     const newId = this.generateId;
     return new ReadableStream<LanguageModelV4StreamPart>({
       async start(controller) {
-        controller.enqueue({ type: "stream-start", warnings });
         const textId = newId();
         const reasoningId = newId();
         let hasText = false;
         let hasReasoning = false;
         let hasToolCalls = false;
         let usage = createEmptyUsage();
+
+        // `stream-start` is the only stream part that carries warnings, so it is held back until
+        // the first real event: the native side reports the properties it had to drop from a tool's
+        // guide ahead of the first token, and those warnings belong on this part. The delay is
+        // protocol-only — the triggering event is enqueued immediately after.
+        const pendingWarnings = [...warnings];
+        let started = false;
+        const ensureStarted = () => {
+          if (started) {
+            return;
+          }
+          started = true;
+          controller.enqueue({ type: "stream-start", warnings: pendingWarnings });
+        };
 
         const closeOpenBlocks = () => {
           if (hasReasoning) {
@@ -874,6 +910,11 @@ export class AppleIntelligenceChatLanguageModel implements LanguageModelV4 {
 
         try {
           for await (const event of nativeStream) {
+            if (event.type === "warning") {
+              pendingWarnings.push({ type: "other", message: event.message });
+              continue;
+            }
+            ensureStarted();
             if (event.type === "text") {
               if (!hasText) {
                 controller.enqueue({ type: "text-start", id: textId });
@@ -928,6 +969,8 @@ export class AppleIntelligenceChatLanguageModel implements LanguageModelV4 {
 
           closeOpenBlocks();
 
+          // A stream that produced nothing at all still has to start before it finishes.
+          ensureStarted();
           controller.enqueue({
             type: "finish",
             finishReason: hasToolCalls ? TOOL_CALLS_FINISH : STOP_FINISH,

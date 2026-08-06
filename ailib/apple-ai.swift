@@ -1207,9 +1207,12 @@ private func createToolOutputEntry(from message: ChatMessage) -> [Transcript.Ent
 //   0x02  error         — the remainder is a JSON error object: {code, message, contextSize?, tokenCount?}
 //   0x03  reasoning      — the remainder is a reasoning/chain-of-thought text delta (reserved)
 //   0x04  usage          — the remainder is a JSON usage object, emitted once before end-of-stream
+//   0x05  warning        — the remainder is a plain-text warning (e.g. a property dropped from a
+//                          tool's guide), emitted before the first answer token
 private let ERROR_SENTINEL: Character = "\u{0002}"
 private let REASONING_SENTINEL: Character = "\u{0003}"
 private let USAGE_SENTINEL: Character = "\u{0004}"
+private let WARNING_SENTINEL: Character = "\u{0005}"
 
 @available(macOS 26.0, *)
 @inline(__always)
@@ -1217,6 +1220,20 @@ private func emitError(
     _ error: BridgeError, to onChunk: (@convention(c) (UnsafePointer<CChar>?) -> Void)
 ) {
     let full = String(ERROR_SENTINEL) + error.streamJson
+    full.withCString { cStr in
+        onChunk(strdup(cStr))
+    }
+}
+
+/// Emit a non-fatal warning on the stream — generation continues. Used for the properties a tool's
+/// schema declares but the guide had to drop, which the host turns into an AI SDK call warning; the
+/// alternative (saying nothing) is the silent degradation this converter exists to avoid.
+@available(macOS 26.0, *)
+@inline(__always)
+private func emitWarning(
+    _ message: String, to onChunk: (@convention(c) (UnsafePointer<CChar>?) -> Void)
+) {
+    let full = String(WARNING_SENTINEL) + message
     full.withCString { cStr in
         onChunk(strdup(cStr))
     }
@@ -1691,6 +1708,79 @@ private func literalChoicesSchema(
     return .init(name: name(), description: description, anyOf: dynamicChoices)
 }
 
+/// Shared state for converting one JSON Schema document: unique type names, the document's
+/// definitions (converted lazily, memoized), the dependency schemas that conversion produced, and
+/// the log of properties dropped from the guide.
+///
+/// A property whose declared shape guided generation cannot express is only ever dropped when the
+/// schema does not `require` it — the guide then asks for less than the schema allows, which is a
+/// narrowing the caller's own validator still accepts. It is never dropped *silently*: every drop
+/// is recorded here and travels back to the host as a warning.
+@available(macOS 26.0, *)
+private final class SchemaConversionContext {
+    let definitions: [String: [String: Any]]
+    /// Allocated name per `definitions`/`$defs` key, so a `$ref` resolves to the name its
+    /// dependency was registered under.
+    let referenceNames: [String: String]
+    let allocator: SchemaNameAllocator
+    /// Converted `definitions`/`$defs` entries, in conversion order, for `GenerationSchema`'s
+    /// `dependencies:`. Only the referenced ones are here: a definition nothing reaches contributes
+    /// no contract, so it is never converted.
+    private(set) var dependencies: [DynamicGenerationSchema] = []
+    private(set) var omissions: [String] = []
+    private var definitionResults: [String: Result<DynamicGenerationSchema, ConversationError>] = [:]
+
+    init(
+        definitions: [String: [String: Any]], referenceNames: [String: String],
+        allocator: SchemaNameAllocator
+    ) {
+        self.definitions = definitions
+        self.referenceNames = referenceNames
+        self.allocator = allocator
+    }
+
+    func recordOmission(path: String, reason: String) {
+        omissions.append(
+            "Property \"\(path)\" was omitted from the generated guide: \(reason) The schema does "
+                + "not list it under 'required', so the model is never asked for it and the result "
+                + "still satisfies the schema — but nothing will fill this field.")
+    }
+
+    /// The converted schema for a `definitions`/`$defs` entry, or a throw carrying why it cannot be
+    /// expressed. Memoized, so a definition converts once and fails identically wherever it is
+    /// referenced from — which is what lets a definition reached only through *optional* properties
+    /// fail without taking the whole document down: the decision belongs to each reference site.
+    ///
+    /// Termination is guaranteed by `assertSchemaNodeIsExpressible`, which rejects reference cycles
+    /// before any conversion starts.
+    func definitionSchema(_ key: String) throws -> DynamicGenerationSchema {
+        if let cached = definitionResults[key] {
+            switch cached {
+            case .success(let schema): return schema
+            case .failure(let error): throw error
+            }
+        }
+        guard let body = definitions[key] else {
+            throw ConversationError.unsupportedSchema(
+                "Schema reference '\(key)' could not be resolved; define '\(key)' under "
+                    + "'definitions' or '$defs' in the same schema document.")
+        }
+        do {
+            let schema = try convertJSONSchemaToDynamic(
+                body, preferredName: key, assignedName: referenceNames[key], path: key,
+                context: self)
+            definitionResults[key] = .success(schema)
+            dependencies.append(schema)
+            return schema
+        } catch ConversationError.unsupportedSchema(let reason) {
+            let failure = ConversationError.unsupportedSchema(
+                "Schema definition '\(key)' cannot be expressed: \(reason)")
+            definitionResults[key] = .failure(failure)
+            throw failure
+        }
+    }
+}
+
 /// Walk a schema node and refuse the shapes guided generation cannot express, so the caller gets a
 /// typed `unsupported-guide` refusal it can fall back from — rather than a plausible-looking object
 /// that is quietly wrong.
@@ -1698,6 +1788,14 @@ private func literalChoicesSchema(
 /// `stack` carries the definitions currently being expanded, which is how a reference cycle
 /// (`Node → children → Node`) is detected: `GenerationSchema` has no way to express a type that
 /// contains itself, since the guide would have to be infinitely deep.
+///
+/// This gate is about the document's *reference graph*, not about the shape of any one property, so
+/// it refuses the whole document — a cycle or a dangling `$ref` is unexpressible (and, for a
+/// dangling one, simply malformed) wherever it sits, and there is no partial guide to fall back to.
+/// Property-level inexpressibility is the other half of the story and is handled during conversion,
+/// where a property the schema does not require is dropped and reported instead of refused.
+///
+/// Running it first is also what lets `SchemaConversionContext.definitionSchema` recurse safely.
 @available(macOS 26.0, *)
 private func assertSchemaNodeIsExpressible(
     _ node: Any,
@@ -1769,23 +1867,31 @@ private func assertSchemaNodeIsExpressible(
 /// then cannot express absence, invents a value instead, and the caller's own validator *passes* it
 /// (a string does satisfy `string | null`). A typed refusal is recoverable; confident wrong data is
 /// not.
+///
+/// A throw is not always fatal: an object catches it for each of its *non-required* properties,
+/// drops that property from the guide and records the reason (see the `object` case). `path` is the
+/// dotted property path used in that report.
 @available(macOS 26.0, *)
 private func convertJSONSchemaToDynamic(
     _ dict: [String: Any],
     preferredName: String,
     assignedName: String? = nil,
-    allocator: SchemaNameAllocator,
-    referenceNames: [String: String]
+    path: String = "",
+    context: SchemaConversionContext
 ) throws -> DynamicGenerationSchema {
     // Resolved to the *allocated* name of the referenced definition — `referenceTo:` takes a schema
     // name, not a JSON pointer, so passing the raw `#/definitions/X` never matched anything.
+    // Converting the target here (memoized, so at most once) is also what tells this reference site
+    // whether the definition can be expressed at all — so a definition reached only from optional
+    // properties can fail without taking the document down.
     if let ref = dict["$ref"] as? String {
         let key = schemaReferenceKey(ref)
-        return .init(referenceTo: referenceNames[key] ?? key)
+        _ = try context.definitionSchema(key)
+        return .init(referenceTo: context.referenceNames[key] ?? key)
     }
 
     let description = dict["description"] as? String
-    func name() -> String { assignedName ?? allocator.allocate(preferred: preferredName) }
+    func name() -> String { assignedName ?? context.allocator.allocate(preferred: preferredName) }
 
     // `allOf` is an intersection, which guided generation has no primitive for. A single-member
     // `allOf` is the common "wrap a `$ref` so a description can sit beside it" idiom and *is* its
@@ -1797,8 +1903,8 @@ private func convertJSONSchemaToDynamic(
                     + "generation cannot express. Flatten the intersection into one object schema.")
         }
         return try convertJSONSchemaToDynamic(
-            only, preferredName: preferredName, assignedName: assignedName,
-            allocator: allocator, referenceNames: referenceNames)
+            only, preferredName: preferredName, assignedName: assignedName, path: path,
+            context: context)
     }
 
     // OpenAPI 3.0 spells nullability `nullable: true` instead of a `null` union member, and schemas
@@ -1809,8 +1915,7 @@ private func convertJSONSchemaToDynamic(
         var inner = dict
         inner.removeValue(forKey: "nullable")
         let base = try convertJSONSchemaToDynamic(
-            inner, preferredName: "\(preferredName)Value", allocator: allocator,
-            referenceNames: referenceNames)
+            inner, preferredName: "\(preferredName)Value", path: path, context: context)
         return .init(
             name: name(), description: description, anyOf: [base, try nullDynamicSchema()])
     }
@@ -1833,8 +1938,8 @@ private func convertJSONSchemaToDynamic(
             }
             dynamicChoices.append(
                 try convertJSONSchemaToDynamic(
-                    choice, preferredName: "\(preferredName)Choice\(index + 1)",
-                    allocator: allocator, referenceNames: referenceNames))
+                    choice, preferredName: "\(preferredName)Choice\(index + 1)", path: path,
+                    context: context))
         }
         if dynamicChoices.isEmpty {
             return .init(name: name(), description: description, anyOf: stringChoices)
@@ -1845,7 +1950,7 @@ private func convertJSONSchemaToDynamic(
             // they were legal answers.
             dynamicChoices.insert(
                 .init(
-                    name: allocator.allocate(preferred: "\(preferredName)Literal"),
+                    name: context.allocator.allocate(preferred: "\(preferredName)Literal"),
                     description: nil, anyOf: stringChoices),
                 at: 0)
         }
@@ -1857,16 +1962,16 @@ private func convertJSONSchemaToDynamic(
     // `{"type": "number", "const": 42}` a free number, with the model never told the constraint.
     if let enums = dict["enum"] as? [Any] {
         return try literalChoicesSchema(
-            enums, label: preferredName, description: description, allocator: allocator,
-            mayInline: assignedName == nil, name: name)
+            enums, label: preferredName, description: description,
+            allocator: context.allocator, mayInline: assignedName == nil, name: name)
     }
     // A bare literal (`z.literal("x")` → `{"type": "string", "const": "x"}`). Pinning it keeps the
     // guide honest; treating it as a free value let the model answer anything and pushed the
     // failure into the caller's validator.
     if let literal = dict["const"] {
         return try literalChoicesSchema(
-            [literal], label: preferredName, description: description, allocator: allocator,
-            mayInline: assignedName == nil, name: name)
+            [literal], label: preferredName, description: description,
+            allocator: context.allocator, mayInline: assignedName == nil, name: name)
     }
 
     let types = jsonSchemaTypeNames(dict)
@@ -1880,8 +1985,8 @@ private func convertJSONSchemaToDynamic(
             member["type"] = typeName
             choices.append(
                 try convertJSONSchemaToDynamic(
-                    member, preferredName: "\(preferredName)Choice\(index + 1)",
-                    allocator: allocator, referenceNames: referenceNames))
+                    member, preferredName: "\(preferredName)Choice\(index + 1)", path: path,
+                    context: context))
         }
         return .init(name: name(), description: description, anyOf: choices)
     }
@@ -1939,8 +2044,8 @@ private func convertJSONSchemaToDynamic(
                                 + "schema object.")
                     }
                     return try convertJSONSchemaToDynamic(
-                        memberDict, preferredName: "\(preferredName)Item", allocator: allocator,
-                        referenceNames: referenceNames)
+                        memberDict, preferredName: "\(preferredName)Item", path: path,
+                        context: context)
                 } ?? .init(type: String.self)
             return .init(
                 arrayOf: itemSchema, minimumElements: prefix.count, maximumElements: prefix.count)
@@ -1948,8 +2053,7 @@ private func convertJSONSchemaToDynamic(
 
         if let items = dict["items"], let itemsDict = jsonSchemaObject(items) {
             let itemSchema = try convertJSONSchemaToDynamic(
-                itemsDict, preferredName: "\(preferredName)Item", allocator: allocator,
-                referenceNames: referenceNames)
+                itemsDict, preferredName: "\(preferredName)Item", path: path, context: context)
             return .init(arrayOf: itemSchema, minimumElements: min, maximumElements: max)
         }
         // No item schema at all (`{"type": "array"}` — an array of anything). A narrowing to
@@ -1983,8 +2087,15 @@ private func convertJSONSchemaToDynamic(
         let objectName = name()
         let required = (dict["required"] as? [String]) ?? []
         var props: [DynamicGenerationSchema.Property] = []
-        if let properties = declared {
-            for (propName, subSchemaAny) in properties {
+        // Sorted so the guide's property order — and the names allocated while converting the
+        // children — do not depend on dictionary iteration order.
+        for (propName, subSchemaAny) in (declared ?? [:]).sorted(by: { $0.key < $1.key }) {
+            let propertyPath = path.isEmpty ? propName : "\(path).\(propName)"
+            // Only `required` decides presence. A `.nullable()` field stays required and carries an
+            // explicit `null` in its union; marking it optional instead would let the model omit the
+            // key, which `z.string().nullable()` rejects.
+            let isOptional = !required.contains(propName)
+            do {
                 // A property whose schema is not an object used to be skipped, dropping it out of
                 // the guide entirely — the model was never told a required field existed.
                 guard let subSchemaDict = jsonSchemaObject(subSchemaAny) else {
@@ -1993,17 +2104,35 @@ private func convertJSONSchemaToDynamic(
                             + "satisfy, or a value that is not a schema at all.")
                 }
                 let subSchema = try convertJSONSchemaToDynamic(
-                    subSchemaDict, preferredName: propName, allocator: allocator,
-                    referenceNames: referenceNames)
-                // Only `required` decides presence. A `.nullable()` field stays required and carries
-                // an explicit `null` in its union; marking it optional instead would let the model
-                // omit the key, which `z.string().nullable()` rejects.
-                let isOptional = !required.contains(propName)
-                let prop = DynamicGenerationSchema.Property(
-                    name: propName, description: subSchemaDict["description"] as? String,
-                    schema: subSchema, isOptional: isOptional)
-                props.append(prop)
+                    subSchemaDict, preferredName: propName, path: propertyPath, context: context)
+                props.append(
+                    DynamicGenerationSchema.Property(
+                        name: propName, description: subSchemaDict["description"] as? String,
+                        schema: subSchema, isOptional: isOptional))
+            } catch ConversationError.unsupportedSchema(let reason) {
+                // This property cannot be expressed. If the schema *requires* it, no guide can
+                // satisfy the contract and the only honest answer is the refusal — the caller has
+                // to know. If it does not, dropping the property narrows the guide: the model is
+                // never asked for the field, never invents one, and the caller's own validator
+                // still accepts the result because the field was optional all along. The drop is
+                // reported (see `SchemaConversionContext.recordOmission`), never silent.
+                guard isOptional else {
+                    throw ConversationError.unsupportedSchema(
+                        reason.hasPrefix("Required property")
+                            ? reason
+                            : "Required property \"\(propertyPath)\" cannot be expressed: \(reason)")
+                }
+                context.recordOmission(path: propertyPath, reason: reason)
             }
+        }
+        // Every declared property dropped: the guide would be an object with no fields at all,
+        // which is exactly the failure the open-map refusal exists to prevent — the model can only
+        // answer `{}`. Refuse instead, and let this object's owner apply the same rule to it
+        // (dropped when optional, refused when required, refused at the root).
+        if declared?.isEmpty == false && props.isEmpty {
+            throw ConversationError.unsupportedSchema(
+                "None of the properties declared by \"\(preferredName)\" can be expressed by "
+                    + "Apple's guided generation, so its guide would carry no fields at all.")
         }
         return .init(name: objectName, description: description, properties: props)
     default:
@@ -2043,14 +2172,17 @@ private func generatedContentToJSON(_ content: GeneratedContent) -> Any {
     }
 }
 
-/// Build the root schema plus its dependencies from a JSON Schema document.
+/// Build the root schema plus its dependencies from a JSON Schema document, along with the
+/// human-readable report of every property dropped from the guide.
 ///
-/// Throws `ConversationError.unsupportedSchema` for shapes guided generation cannot express
-/// (unresolvable or recursive `$ref`s) rather than letting them degrade into a wrong-but-confident
-/// guide.
+/// Throws `ConversationError.unsupportedSchema` when the *document* cannot be expressed —
+/// unresolvable or recursive `$ref`s, or a required property (at any depth) whose shape guided
+/// generation has no counterpart for — rather than letting it degrade into a wrong-but-confident
+/// guide. Non-required properties with such a shape are dropped instead, and named in the returned
+/// warnings so the caller can see what will never be filled.
 @available(macOS 26.0, *)
 private func buildSchemasFromJson(_ json: [String: Any]) throws -> (
-    DynamicGenerationSchema, [DynamicGenerationSchema]
+    DynamicGenerationSchema, [DynamicGenerationSchema], [String]
 ) {
     let definitions = collectSchemaDefinitions(json)
     var stack: [String] = []
@@ -2070,26 +2202,17 @@ private func buildSchemasFromJson(_ json: [String: Any]) throws -> (
     for key in definitionKeys {
         referenceNames[key] = allocator.allocate(preferred: key)
     }
+    let context = SchemaConversionContext(
+        definitions: definitions, referenceNames: referenceNames, allocator: allocator)
 
-    let dependencies = try definitionKeys.map { key in
-        try convertJSONSchemaToDynamic(
-            definitions[key]!, preferredName: key, assignedName: referenceNames[key],
-            allocator: allocator, referenceNames: referenceNames)
-    }
-
-    // Determine root schema
-    if let rootDefinitionKey, let rootDef = definitions[rootDefinitionKey] {
-        let root = try convertJSONSchemaToDynamic(
-            rootDef, preferredName: rootDefinitionKey, allocator: allocator,
-            referenceNames: referenceNames)
-        return (root, dependencies)
-    }
-
-    // Fallback
+    // The definitions convert on demand, from the `$ref`s that reach them (see
+    // `SchemaConversionContext.definitionSchema`) — a definition nothing references carries no
+    // contract, and one referenced only from properties that end up dropped is dropped with them.
     let root = try convertJSONSchemaToDynamic(
-        json, preferredName: json["title"] as? String ?? "Object", allocator: allocator,
-        referenceNames: referenceNames)
-    return (root, dependencies)
+        rootDefinitionKey.flatMap { definitions[$0] } ?? json,
+        preferredName: rootDefinitionKey ?? (json["title"] as? String ?? "Object"),
+        context: context)
+    return (root, context.dependencies, context.omissions)
 }
 
 // MARK: - Tool Call Collection for Natural Completion
@@ -2453,7 +2576,7 @@ private func handleStructuredMode(
     }
 
     // Build schema from JSON
-    let (rootSchema, deps) = try buildSchemasFromJson(jsonObj)
+    let (rootSchema, deps, schemaWarnings) = try buildSchemasFromJson(jsonObj)
     let generationSchema = try GenerationSchema(root: rootSchema, dependencies: deps)
 
     // Create session without tools (structured generation doesn't use tools constructor)
@@ -2477,6 +2600,10 @@ private func handleStructuredMode(
         "text": textRepresentation,
         "object": objectJson,
     ]
+    // The properties the guide had to drop. They ride back with the successful result — the host
+    // surfaces them as call warnings, so a caller learns a field will never be filled without
+    // having to read the schema converter's source.
+    if !schemaWarnings.isEmpty { json["schemaWarnings"] = schemaWarnings }
     if #available(macOS 27.0, *) { json["usage"] = readUsage(from: session).jsonObject }
 
     let jsonData = try JSONSerialization.data(withJSONObject: json, options: [])
@@ -2501,13 +2628,17 @@ private func handleToolsMode(
 
     // Build tools
     var tools: [any Tool] = []
+    // Parameters a tool declares but its guide could not carry (optional properties whose shape
+    // guided generation cannot express). Attributed per tool, since a request carries several.
+    var schemaWarnings: [String] = []
     for dict in rawToolsArr {
         guard let idNum = dict["id"] as? UInt64,
             let name = dict["name"] as? String
         else { continue }
         let description = dict["description"] as? String ?? ""
         let paramsSchemaJson = dict["parameters"] as? [String: Any] ?? [:]
-        let (root, deps) = try buildSchemasFromJson(paramsSchemaJson)
+        let (root, deps, warnings) = try buildSchemasFromJson(paramsSchemaJson)
+        schemaWarnings.append(contentsOf: warnings.map { "Tool \"\(name)\": \($0)" })
         let genSchema = try GenerationSchema(root: root, dependencies: deps)
         let proxy = JSProxyTool(
             toolID: idNum, name: name, description: description, parametersSchema: genSchema
@@ -2565,6 +2696,7 @@ private func handleToolsMode(
 
         var json: [String: Any] = [:]
         if let usage { json["usage"] = usage.jsonObject }
+        if !schemaWarnings.isEmpty { json["schemaWarnings"] = schemaWarnings }
 
         if !toolCalls.isEmpty {
             let formattedCalls = toolCalls.map { call in
@@ -2592,6 +2724,12 @@ private func handleToolsMode(
         // Streaming with tools
         guard let onChunk = onChunk else {
             throw ConversationError.invalidJSON("No callback provided for streaming")
+        }
+
+        // Emitted before the first answer token so the host can attach them to the stream's
+        // `stream-start` warnings, which is the only place the AI SDK protocol carries warnings.
+        for warning in schemaWarnings {
+            emitWarning(warning, to: onChunk)
         }
 
         // Initialize coordination with configurable early termination

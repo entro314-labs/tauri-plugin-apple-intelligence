@@ -240,6 +240,14 @@ export type AppleIntelligenceGenerateResult = {
   toolCalls?: AppleIntelligenceToolCall[];
   object?: unknown;
   usage?: AppleIntelligenceUsage;
+  /**
+   * Properties a schema declared that the generated guide could not carry: shapes Apple's guided
+   * generation cannot express (open maps, heterogeneous tuples, boolean literals, …) sitting on
+   * properties the schema does not `require`. They are dropped so the rest of the schema still
+   * works — a *required* one is refused outright with `unsupported-guide` — and reported here so
+   * the drop is never silent. The AI SDK provider turns each entry into a call warning.
+   */
+  schemaWarnings?: string[];
 };
 
 export type AppleIntelligenceStreamEvent =
@@ -252,6 +260,12 @@ export type AppleIntelligenceStreamEvent =
       args: Record<string, unknown>;
     }
   | { type: "usage"; usage: AppleIntelligenceUsage }
+  /**
+   * A non-fatal notice; the stream continues. Carries the properties a tool's schema declared but
+   * its guide could not express (see {@link AppleIntelligenceGenerateResult.schemaWarnings}), and
+   * arrives before the first text delta.
+   */
+  | { type: "warning"; message: string }
   | { type: "done" }
   | {
       type: "error";

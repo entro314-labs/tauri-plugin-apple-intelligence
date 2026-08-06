@@ -13,8 +13,13 @@ use std::time::{Duration, Instant};
 
 use tauri::Listener;
 use tauri_plugin_apple_intelligence::{
-    AppleAIGenerateRequest, AppleAIMessage, AppleIntelligenceExt,
+    AppleAIGenerateRequest, AppleAIMessage, AppleAIToolDefinition, AppleIntelligenceExt,
 };
+
+/// The plugin serializes streams — one active at a time, host-wide — so the streaming tests in this
+/// binary (which `cargo test` runs on parallel threads) have to take turns or the second one is
+/// rejected with `StreamBusy`.
+static STREAM_SLOT: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn request(prompt: &str) -> AppleAIGenerateRequest {
     AppleAIGenerateRequest {
@@ -43,6 +48,7 @@ fn request(prompt: &str) -> AppleAIGenerateRequest {
 #[test]
 #[ignore = "requires the on-device Apple Intelligence model — run locally with --ignored"]
 fn cancel_frees_the_stream_slot_and_emits_done() {
+    let _slot = STREAM_SLOT.lock().unwrap_or_else(|error| error.into_inner());
     let app = tauri::test::mock_builder()
         .plugin(tauri_plugin_apple_intelligence::init())
         .build(tauri::test::mock_context(tauri::test::noop_assets()))
@@ -128,4 +134,101 @@ fn cancel_frees_the_stream_slot_and_emits_done() {
     while !second_done.load(Ordering::SeqCst) && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+/// The streaming half of the dropped-property report. A tool whose *optional* parameter cannot be
+/// expressed still works, and the properties left out of its guide arrive on the event channel as
+/// `warning` events **before** any answer content — which is what lets the TS provider put them on
+/// `stream-start`, the only stream part the AI SDK protocol lets warnings ride on.
+#[test]
+#[ignore = "requires the on-device Apple Intelligence model — run locally with --ignored"]
+fn dropped_tool_properties_are_reported_on_the_stream() {
+    let _slot = STREAM_SLOT.lock().unwrap_or_else(|error| error.into_inner());
+    let app = tauri::test::mock_builder()
+        .plugin(tauri_plugin_apple_intelligence::init())
+        .build(tauri::test::mock_context(tauri::test::noop_assets()))
+        .expect("mock app with plugin");
+    let handle = app.handle().clone();
+    let ai = handle.apple_intelligence();
+
+    let availability = ai.check_availability().expect("availability");
+    if !availability.available {
+        eprintln!("SKIP: model unavailable ({})", availability.reason);
+        return;
+    }
+
+    let mut streamed = request("Save a note titled \"Ferry Log\" with the save_note tool.");
+    streamed.tools = Some(vec![AppleAIToolDefinition {
+        name: "save_note".to_string(),
+        description: Some("Save a note".to_string()),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "title": {"type": "string"},
+                // z.record(z.string(), z.unknown()).optional() — inexpressible, not required.
+                "frontmatter": {
+                    "type": "object",
+                    "propertyNames": {"type": "string"},
+                    "additionalProperties": false,
+                },
+            },
+            "required": ["title"],
+        }),
+    }]);
+
+    let start = ai.stream(streamed).expect("stream start");
+
+    let events: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let warnings: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let done = Arc::new(AtomicBool::new(false));
+    {
+        let events = Arc::clone(&events);
+        let warnings = Arc::clone(&warnings);
+        let done = Arc::clone(&done);
+        handle.listen(start.event_name.clone(), move |event| {
+            let payload: serde_json::Value =
+                serde_json::from_str(event.payload()).expect("event payload json");
+            let kind = payload
+                .get("type")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+                .to_string();
+            if kind == "warning"
+                && let Some(message) = payload.get("message").and_then(|value| value.as_str())
+            {
+                warnings.lock().unwrap().push(message.to_string());
+            }
+            if kind == "done" || kind == "error" {
+                done.store(true, Ordering::SeqCst);
+            }
+            events.lock().unwrap().push(kind);
+        });
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(90);
+    while !done.load(Ordering::SeqCst) {
+        assert!(Instant::now() < deadline, "the stream never terminated");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let seen = events.lock().unwrap().clone();
+    let reported = warnings.lock().unwrap().clone();
+    eprintln!("stream events: {seen:?}\nstream warnings: {reported:?}");
+    assert!(
+        !reported.is_empty(),
+        "the dropped property must be reported on the stream: {seen:?}"
+    );
+    assert!(
+        reported.iter().any(|message| message.contains("frontmatter")),
+        "the report must name the dropped property: {reported:?}"
+    );
+    let first_warning = seen.iter().position(|kind| kind == "warning").expect("warning event");
+    let first_content = seen
+        .iter()
+        .position(|kind| kind == "text" || kind == "tool-call")
+        .unwrap_or(usize::MAX);
+    assert!(
+        first_warning < first_content,
+        "warnings must precede any answer content so they can ride on `stream-start`: {seen:?}"
+    );
 }

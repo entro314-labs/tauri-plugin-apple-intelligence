@@ -130,8 +130,10 @@ transport talks to this plugin, and a custom transport (e.g. a future Node bridg
 - **Runtime capability queries** on the transport — `checkPrivateCloudAvailability()`,
   `getContextInfo(model)`, `tokenCount(text, model)`, `getSupportedLanguages()`,
   `prewarm(model, promptPrefix?)`
-- **Warnings, not silent drops** — unsupported settings (`stopSequences`, penalties) and
-  over-budget tool counts (Apple recommends 3–5 tools per request) surface as AI SDK warnings
+- **Warnings, not silent drops** — unsupported settings (`stopSequences`, penalties), over-budget
+  tool counts (Apple recommends 3–5 tools per request), and every property dropped from a guide
+  because guided generation cannot express it (see
+  [Refused vs. omitted](#refused-vs-omitted)) surface as AI SDK warnings
 
 ### Handling the context window
 
@@ -228,6 +230,10 @@ converts into a FoundationModels `GenerationSchema`. Supported: objects, nested 
 integers), `required`, `description`, and `$ref` into `definitions` (draft-07) or `$defs`
 (2020-12).
 
+Shapes the framework cannot express are never quietly coerced into something else. A **required**
+one is refused with the typed `unsupported-guide` code; an **optional** one is dropped from the
+guide and reported as a warning — see [Refused vs. omitted](#refused-vs-omitted).
+
 ### Numbers, literals, and bounds
 
 Guided generation has no numeric-literal primitive, but `GenerationGuide` has numeric bounds, and a
@@ -260,8 +266,9 @@ its members all have the **same** shape, which is exactly a fixed-length array:
 `z.tuple([z.string(), z.string()])` generates an array of exactly two strings.
 
 A tuple with **differently typed** members (`z.tuple([z.string(), z.number()])`) or with a trailing
-rest schema is refused with `unsupported-guide`: an array guide carries one element schema and a
-length range, not per-position types.
+rest schema cannot be expressed: an array guide carries one element schema and a length range, not
+per-position types. Required, it is refused with `unsupported-guide`; optional, it is dropped from
+the guide and reported — see [Refused vs. omitted](#refused-vs-omitted).
 
 > Before 0.9.0 neither spelling was recognised at all — `items` was only read as an object — so
 > every tuple fell through to an *unbounded array of strings*. `z.tuple([z.string(), z.number()])`
@@ -289,13 +296,17 @@ it was not read at all before, so OpenAPI-derived schemas had the pre-0.8.0 fail
 Nullable fields need **macOS 26.4+** (`DynamicGenerationSchema.null`). On macOS 26.0–26.3 they are
 refused with `unsupported-guide` rather than silently flattened.
 
-### Open maps (`z.record`) are refused
+### Open maps (`z.record`)
 
 `z.record(z.string(), z.string())` emits `{"type": "object", "additionalProperties": {...}}` with no
 `properties`. An object guide is a **fixed list of named properties** — `DynamicGenerationSchema`
-has no map-shaped constructor at all — so there is nothing to convert this into. It is refused with
-`unsupported-guide`, naming the property. The `patternProperties` (draft-07) and bare
-`propertyNames` spellings are refused the same way.
+has no map-shaped constructor at all — so there is nothing to convert this into. The
+`patternProperties` (draft-07) and bare `propertyNames` spellings (the one the AI SDK's zod
+conversion leaves behind) are the same shape.
+
+A **required** open map is refused with `unsupported-guide`, naming the property. An **optional**
+one is dropped from the guide and reported as a warning — see
+[Refused vs. omitted](#refused-vs-omitted).
 
 Model the map as declared keys, or as an array of `{key, value}` objects:
 
@@ -308,20 +319,20 @@ Model the map as declared keys, or as an array of `{key, value}` objects:
 > `{"properties": {}, "additionalProperties": false}` and the model could only ever answer `{}` —
 > which `z.record()` then *accepted*. Nothing reported an error anywhere. Any `z.record()` field
 > validated against ≤ 0.8.0 came back empty; re-check those call sites.
+>
+> 0.9.0 refused the **whole** schema over one such field, including when the field was optional —
+> so a tool set with a single `z.record(...).optional()` parameter stopped working entirely. From
+> 0.10.0 only the property is dropped, and only when the schema does not require it.
 
 `additionalProperties` beside **declared** `properties` is not affected. `additionalProperties:
 false` is the ordinary closed object every `z.object()` emits, and `additionalProperties: true`/`{}`
 (`z.looseObject()`) merely *permits* extra keys without requiring any — so the declared properties
 are generated and the open part is ignored, which is a narrowing nothing downstream can reject.
 
-### Shapes that are refused
+### Shapes the framework cannot express
 
-These cannot be expressed by the framework at all, and are refused up front with the typed
-`unsupported-guide` code rather than answered with a plausible-looking wrong object:
+These have no counterpart in guided generation at all:
 
-- **Recursive schemas** — a definition that (directly or transitively) contains itself, or a
-  `"$ref": "#"` back at the whole document. The guide would have to be infinitely deep.
-- **Unresolvable `$ref`s** — a reference with no matching entry under `definitions`/`$defs`.
 - **Multi-member `allOf`** — a schema intersection. Flatten it into one object schema. (A
   single-member `allOf`, the "wrap a `$ref` so a `description` can sit beside it" idiom, is just
   its one member and is accepted.)
@@ -337,6 +348,43 @@ These cannot be expressed by the framework at all, and are refused up front with
   `null` can be pinned.
 - **The schema `false`** for a property, and any property value that is not a schema. (`true` is the
   empty schema and is accepted.)
+- **An object whose every declared property is one of the above** and none of them required — its
+  guide would carry no fields at all, so the model could only answer `{}`. It is treated as
+  unexpressible in turn, and the rule below applies to *it*.
+
+#### Refused vs. omitted
+
+What happens next depends on **one thing only: whether the schema requires the property.**
+
+| Where the shape sits | Result |
+| --- | --- |
+| A property listed in `required` (at any depth) | **Refused** — the call throws `unsupported-guide`, naming the property by path. No guide can satisfy the contract, so the caller has to know. |
+| A property *not* listed in `required` | **Omitted** — the property is dropped from the guide, generation proceeds, and a warning names it. The model is never asked for the field, so it cannot invent one; the result still satisfies the schema, because the property was optional. |
+| The root schema itself (e.g. a top-level `z.record()`) | **Refused** — there is no guide left to narrow. |
+
+Omission is never silent. Each dropped property is reported through the channel the provider already
+uses for unsupported settings:
+
+- **AI SDK** — an entry in `result.warnings` (and in `stream-start`'s warnings for `streamText`),
+  which the SDK also logs as `AI SDK Warning (apple-intelligence / …): Property "…" was omitted …`.
+- **Raw transport** — `schemaWarnings?: string[]` on the generate result, and a
+  `{ type: "warning", message }` stream event ahead of the first token.
+- **Rust** — `AppleAIGenerateResult::schema_warnings` and `AppleAIStreamEvent::Warning`.
+
+```ts
+// updates.frontmatter / updates.metadata are z.record(...).optional():
+// the tool converts, the model fills the rest, and two warnings say what was dropped.
+const { warnings } = await generateText({ model: appleAI("apple-on-device"), prompt, tools });
+```
+
+### Shapes that are always refused
+
+Reference-graph problems are a property of the **document**, not of one field, and there is no
+partial guide to fall back to — so these are refused whole, required or not:
+
+- **Recursive schemas** — a definition that (directly or transitively) contains itself, or a
+  `"$ref": "#"` back at the whole document. The guide would have to be infinitely deep.
+- **Unresolvable `$ref`s** — a reference with no matching entry under `definitions`/`$defs`.
 
 A schema node with no `type` at all (`{}`, what zod emits for `any`/`unknown`) is generated as a
 string. That is a narrowing rather than a wrong answer — `{}` accepts any instance, so nothing
@@ -404,8 +452,9 @@ cargo test
 # Live probes against the real model (needs Apple Intelligence enabled): context/token budgeting,
 # the Private Cloud Compute entitlement gate, nested array-of-object schemas, shared `$defs`
 # references, nullable fields (`anyOf`, array `type`, and OpenAPI `nullable` spellings), non-string
-# `enum`/`const` and numeric bounds, fixed-length tuples, and the typed refusals for recursive
-# schemas, open maps, heterogeneous tuples, and boolean literals.
+# `enum`/`const` and numeric bounds, fixed-length tuples, the typed refusals for recursive schemas
+# and for *required* open maps / heterogeneous tuples / boolean literals, and the omit-and-warn
+# path for the same shapes on *optional* properties (object schemas and tool schemas).
 cargo test --test native_probes -- --ignored
 cargo test --test mock_app_stream -- --ignored
 

@@ -308,4 +308,61 @@ function makeTransport(overrides = {}) {
   console.log("11 unsupported-guide refusal → typed error the caller can fall back from OK");
 }
 
+// 12. A property the native converter had to drop from the guide (an *optional* one — a required
+// one is still refused outright) must reach the caller as an AI SDK warning. Silence here is the
+// failure mode this whole series of schema fixes exists to remove: the tool keeps working, and the
+// caller can still find out that a field will never be filled.
+{
+  const omission =
+    'Property "frontmatter" was omitted from the generated guide: The schema for "frontmatter" is ' +
+    "an open map (object with 'propertyNames' and no declared 'properties')…";
+
+  const transport = makeTransport();
+  const generateWithWarnings = transport.generate;
+  transport.generate = async (options) => ({
+    ...(await generateWithWarnings(options)),
+    schemaWarnings: [omission],
+  });
+  transport.stream = async function* () {
+    // The native side reports dropped properties before the first token, so the provider can put
+    // them on `stream-start` — the only stream part that carries warnings.
+    yield { type: "warning", message: omission };
+    yield { type: "text", text: "noted" };
+    yield { type: "done" };
+  };
+
+  const provider = createAppleIntelligenceProvider({ transport });
+
+  const generated = await generateText({ model: provider("apple-on-device"), prompt: "hi" });
+  assert.ok(
+    JSON.stringify(generated.warnings ?? []).includes("frontmatter"),
+    `generate must surface the omission, got ${JSON.stringify(generated.warnings)}`
+  );
+
+  const streamed = streamText({ model: provider("apple-on-device"), prompt: "hi" });
+  let streamedText = "";
+  for await (const delta of streamed.textStream) streamedText += delta;
+  assert.equal(streamedText, "noted", "the warning must not be mistaken for answer text");
+  const streamWarnings = JSON.stringify((await streamed.warnings) ?? []);
+  assert.ok(
+    streamWarnings.includes("frontmatter"),
+    `stream must surface the omission on stream-start, got ${streamWarnings}`
+  );
+
+  const { object } = await generateObject({
+    model: provider("apple-on-device"),
+    schema: jsonSchema({
+      type: "object",
+      properties: { city: { type: "string" }, rating: { type: "number" } },
+      required: ["city", "rating"],
+      additionalProperties: false,
+    }),
+    prompt: "Rate Athens",
+    output: "object",
+    mode: "json",
+  });
+  assert.equal(object.city, "Athens", "generation still succeeds alongside the warning");
+  console.log("12 dropped-property warnings reach the caller OK");
+}
+
 console.log("\nAll smoke tests passed.");
