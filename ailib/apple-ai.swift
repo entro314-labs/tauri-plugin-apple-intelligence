@@ -2521,6 +2521,23 @@ private func makeTextStream(
     return session.streamResponse(to: context.currentPrompt, options: context.options)
 }
 
+/// Diff one cumulative snapshot against the previous one.
+///
+/// `streamResponse` yields *cumulative* snapshots, and a snapshot is not guaranteed to extend the
+/// one before it — the model can revise text it has already emitted. Plain
+/// `dropFirst(previous.count)` assumes a pure append: when that assumption breaks it slices at the
+/// wrong offset and emits garbage, and on a *shortened* snapshot it emits nothing while `previous`
+/// regresses, duplicating text on the following chunk. Diffing from the common prefix degrades
+/// safely — it is exactly `dropFirst` in the append case, and in the revision case emits only the
+/// rewritten tail instead of the whole snapshot. The divergent text already sent cannot be
+/// retracted (a text-delta stream has no such primitive), so this narrows the discrepancy rather
+/// than removing it.
+private func streamDelta(previous: String, current: String) -> String {
+    if current.hasPrefix(previous) { return String(current.dropFirst(previous.count)) }
+    let common = zip(previous, current).prefix { $0.0 == $0.1 }.count
+    return String(current.dropFirst(common))
+}
+
 @available(macOS 26.0, *)
 private func handleBasicMode(context: ConversationContext) async throws -> String {
     let transcript = Transcript(entries: context.transcriptEntries)
@@ -2549,7 +2566,7 @@ private func handleBasicModeStream(
         // Observe cancellation between chunks even if the framework's sequence is slow to.
         try Task.checkCancellation()
 
-        let delta = String(cumulative.content.dropFirst(prev.count))
+        let delta = streamDelta(previous: prev, current: cumulative.content)
         prev = cumulative.content
         guard !delta.isEmpty else { continue }
 
@@ -2751,7 +2768,7 @@ private func handleToolsMode(
                 }
             }
 
-            let delta = String(cumulative.content.dropFirst(prev.count))
+            let delta = streamDelta(previous: prev, current: cumulative.content)
             prev = cumulative.content
             guard !delta.isEmpty else { continue }
 

@@ -400,6 +400,7 @@ These are dropped from the guide, so the model is not told about them. Nothing i
 | --- | --- |
 | `pattern` | `GenerationGuide.pattern` takes a Swift `Regex`, whose syntax is not JSON Schema's ECMA-262 dialect; a mis-translated pattern would over-constrain the model silently. |
 | `minLength`, `maxLength`, `format` | No corresponding guide. |
+| `multipleOf` | No corresponding guide. Not expressible as a bound, so it cannot be narrowed the way exclusive bounds are on integers. |
 | `not` | No corresponding guide. |
 | `exclusiveMinimum`/`exclusiveMaximum` on `number` | No open bound; see above. |
 | `description` beside a `$ref` in a non-property position | `referenceTo:` carries no description. On a property it survives as the property's description. |

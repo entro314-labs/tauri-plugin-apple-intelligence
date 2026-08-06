@@ -426,6 +426,18 @@ export class AppleIntelligenceChatLanguageModel implements LanguageModelV4 {
     if (options.presencePenalty != null) {
       warnings.push({ type: "unsupported", feature: "presencePenalty" });
     }
+    if (options.topK != null && options.topP != null) {
+      // `GenerationOptions.SamplingMode` is a single enum — top-k and nucleus sampling are
+      // mutually exclusive, so the native side takes topK and drops topP. Say so rather than
+      // discarding a caller's setting in silence.
+      warnings.push({
+        type: "unsupported",
+        feature: "topP",
+        details:
+          "Apple Intelligence selects one sampling mode; topK was applied and topP ignored. " +
+          "Set only one.",
+      });
+    }
     if (options.responseFormat?.type === "json" && !options.responseFormat.schema) {
       warnings.push({
         type: "unsupported",
