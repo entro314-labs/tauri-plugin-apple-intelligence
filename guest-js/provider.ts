@@ -332,7 +332,12 @@ export class AppleIntelligenceChatLanguageModel implements LanguageModelV4 {
   async doGenerate(
     options: LanguageModelV4CallOptions
   ): Promise<LanguageModelV4GenerateResult> {
+    // The native inference is a blocking FFI call that cannot be interrupted mid-flight, so the
+    // abort signal is honored at the boundaries: don't start an already-aborted call, and check
+    // again after the availability round-trip.
+    options.abortSignal?.throwIfAborted();
     await this.assertAvailability();
+    options.abortSignal?.throwIfAborted();
 
     const call = this.resolveCall(options);
 
@@ -342,6 +347,7 @@ export class AppleIntelligenceChatLanguageModel implements LanguageModelV4 {
         : undefined;
 
     if (schema) {
+      this.warnIfToolsDropped(call, schema);
       return this.generateStructured(call, schema);
     }
 
@@ -351,6 +357,7 @@ export class AppleIntelligenceChatLanguageModel implements LanguageModelV4 {
   async doStream(
     options: LanguageModelV4CallOptions
   ): Promise<LanguageModelV4StreamResult> {
+    options.abortSignal?.throwIfAborted();
     await this.assertAvailability();
 
     const call = this.resolveCall(options);
@@ -361,6 +368,7 @@ export class AppleIntelligenceChatLanguageModel implements LanguageModelV4 {
         : undefined;
 
     if (schema) {
+      this.warnIfToolsDropped(call, schema);
       // FoundationModels' guided generation has no incremental text stream over the FFI, so
       // structured streaming (streamObject) is simulated from the non-streaming structured
       // result: one stream, one delta carrying the full JSON.
@@ -515,6 +523,24 @@ export class AppleIntelligenceChatLanguageModel implements LanguageModelV4 {
       seed: options.seed,
       warnings,
     };
+  }
+
+  /**
+   * Guided generation and tool calling are mutually exclusive in the native bridge — a call that
+   * carries both gets the schema, and its tools are ignored. Say so rather than dropping them in
+   * silence.
+   */
+  private warnIfToolsDropped(call: ResolvedCall, schema: JSONSchema7 | undefined): void {
+    if (schema && call.tools?.length) {
+      call.warnings.push({
+        type: "unsupported",
+        feature: "tools with responseFormat.json",
+        details:
+          "Apple Intelligence guided generation cannot call tools; the tools were ignored for this call.",
+      });
+      call.tools = undefined;
+      call.toolChoice = undefined;
+    }
   }
 
   private async generateStructured(
