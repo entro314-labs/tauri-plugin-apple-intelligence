@@ -4,7 +4,9 @@ All notable user-facing changes to `tauri-plugin-apple-intelligence` (Rust crate
 `@entro314labs/plugin-apple-intelligence` (npm package). Versions of the two artifacts move
 together.
 
-## Unreleased
+## [Unreleased]
+
+## [0.12.0] - 2026-08-18
 
 ### Fixed
 
