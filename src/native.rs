@@ -291,6 +291,20 @@ mod macos {
             });
         }
 
+        // The slot is reserved. If setup fails before the native task spawns, it must be released
+        // (and the half-built state cleared) — otherwise every later stream is refused with
+        // StreamBusy until the app restarts.
+        stream_with_slot(app, request).inspect_err(|_| {
+            *STREAM_STATE.get_or_init(|| Mutex::new(None)).lock().unwrap() = None;
+            STREAM_ACTIVE.store(false, Ordering::SeqCst);
+        })
+    }
+
+    /// The fallible part of [`stream`], run while the caller holds the single stream slot.
+    fn stream_with_slot<R: tauri::Runtime>(
+        app: AppHandle<R>,
+        request: AppleAIGenerateRequest,
+    ) -> Result<AppleAIStreamStart, AppleAIError> {
         let stream_id = uuid::Uuid::new_v4().to_string();
         let event_name = format!("apple-ai://stream/{stream_id}");
 
