@@ -855,8 +855,8 @@ private struct ChatMessage: Codable {
     let role: String
     let content: String?  // Made optional to support OpenAI format with tool calls
     let name: String?
-    let tool_call_id: String?  // OpenAI-compatible snake_case
-    let tool_calls: [[String: Any]]?  // OpenAI-compatible tool calls array
+    let tool_call_id: String?
+    let tool_calls: [[String: Any]]?  // OpenAI-shaped tool calls array
     let images: [ImageInput]?  // Optional image attachments (multimodal, macOS 27+)
 
     init(
@@ -875,9 +875,16 @@ private struct ChatMessage: Codable {
         self.images = images
     }
 
-    // Custom encoding/decoding to handle the dynamic tool_calls array
+    // Custom encoding/decoding to handle the dynamic tool_calls array.
+    //
+    // The wire keys are camelCase: the Rust plugin serializes `AppleAIMessage` with
+    // `rename_all = "camelCase"` (`toolCallId`, `toolCalls`), matching the TS bindings. These used
+    // to be snake_case here, so an assistant turn's tool calls never decoded — and with them the
+    // matching tool outputs were orphaned — silently breaking every multi-turn tool loop.
     enum CodingKeys: String, CodingKey {
-        case role, content, name, tool_call_id, tool_calls, images
+        case role, content, name, images
+        case tool_call_id = "toolCallId"
+        case tool_calls = "toolCalls"
     }
 
     init(from decoder: Decoder) throws {

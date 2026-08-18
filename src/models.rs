@@ -181,6 +181,33 @@ pub enum AppleAIStreamEvent {
 mod tests {
     use super::*;
 
+    /// Messages cross the FFI boundary as JSON decoded by the Swift bridge's `ChatMessage`, whose
+    /// coding keys are pinned to these exact camelCase names. A silent rename on either side
+    /// drops the assistant's tool calls out of the transcript (the multi-turn tool-loop bug).
+    #[test]
+    fn messages_serialize_camel_case_for_the_swift_bridge() {
+        let message = AppleAIMessage {
+            role: "assistant".into(),
+            content: Some("".into()),
+            name: None,
+            tool_call_id: Some("call_1".into()),
+            tool_calls: Some(vec![AppleAIToolCall {
+                id: "call_1".into(),
+                call_type: "function".into(),
+                function: AppleAIToolCallFunction {
+                    name: "get_weather".into(),
+                    arguments: "{\"city\":\"Athens\"}".into(),
+                },
+            }]),
+            images: None,
+        };
+        let value = serde_json::to_value(&message).unwrap();
+        assert_eq!(value["toolCallId"], "call_1");
+        assert_eq!(value["toolCalls"][0]["id"], "call_1");
+        assert_eq!(value["toolCalls"][0]["type"], "function");
+        assert_eq!(value["toolCalls"][0]["function"]["name"], "get_weather");
+    }
+
     /// The stream events cross the Tauri event channel as JSON consumed by the TS bindings —
     /// field names must be camelCase (`toolCallId`, `contextSize`), which requires
     /// `rename_all_fields` (serde's `rename_all` on an enum renames variants only).

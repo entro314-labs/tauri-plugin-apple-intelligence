@@ -131,6 +131,75 @@ fn system_prompt_is_honored_without_tools() {
     );
 }
 
+/// A completed tool round-trip (assistant `toolCalls` turn + `tool` output message) must survive
+/// into the transcript the model sees. The Swift bridge used to decode the snake_case keys
+/// `tool_calls`/`tool_call_id` while the plugin serializes camelCase, so the assistant's tool
+/// calls never decoded, the matching tool outputs were orphaned, and the model answered from
+/// fabrication instead of the tool results — every AI SDK multi-step tool loop was broken.
+#[test]
+#[ignore = "requires the on-device Apple Intelligence model — run locally with --ignored"]
+fn assistant_tool_call_history_survives_round_trip() {
+    let app = mock_app();
+    let handle = app.handle().clone();
+    if !model_ready(&handle) {
+        return;
+    }
+
+    let message = |role: &str, content: &str| AppleAIMessage {
+        role: role.to_string(),
+        content: Some(content.to_string()),
+        name: None,
+        tool_call_id: None,
+        tool_calls: None,
+        images: None,
+    };
+    let mut assistant_call = message("assistant", "");
+    assistant_call.tool_calls = Some(vec![tauri_plugin_apple_intelligence::AppleAIToolCall {
+        id: "call_1".to_string(),
+        call_type: "function".to_string(),
+        function: tauri_plugin_apple_intelligence::AppleAIToolCallFunction {
+            name: "get_secret".to_string(),
+            arguments: "{}".to_string(),
+        },
+    }]);
+
+    let request = AppleAIGenerateRequest {
+        messages: vec![
+            message("user", "Fetch the secret word with the get_secret tool."),
+            assistant_call,
+            message(
+                "tool",
+                r#"{"tool_calls":[{"id":"call_1","toolName":"get_secret","segments":[{"type":"text","text":"The secret word is XYZZY."}]}]}"#,
+            ),
+            message(
+                "user",
+                "What was the secret word the tool returned? Reply with just that word.",
+            ),
+        ],
+        tools: None,
+        schema: None,
+        model: None,
+        reasoning_level: None,
+        temperature: None,
+        max_tokens: None,
+        top_p: None,
+        top_k: None,
+        seed: None,
+        tool_choice: None,
+        stop_after_tool_calls: None,
+    };
+    let Some(result) = generate_or_skip(&app, request) else {
+        return;
+    };
+    eprintln!("tool-history probe: {:?}", result.text);
+    assert!(
+        result.text.to_uppercase().contains("XYZZY"),
+        "the tool round-trip did not reach the model — assistant toolCalls or tool outputs \
+         are being dropped from the transcript: {:?}",
+        result.text
+    );
+}
+
 #[test]
 #[ignore = "requires the on-device Apple Intelligence model — run locally with --ignored"]
 fn token_count_is_positive_and_below_context_size() {
