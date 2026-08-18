@@ -602,21 +602,28 @@ mod macos {
     const WARNING_SENTINEL: u8 = 0x05;
 
     extern "C" fn stream_chunk_callback(ptr: *const std::os::raw::c_char) {
+        // Copy and free the chunk before anything else, so the strdup'd buffer is released on
+        // every path — including chunks that arrive after the stream state was already cleared
+        // (e.g. text still in flight behind a terminal error).
+        let chunk = if ptr.is_null() {
+            None
+        } else {
+            Some(take_c_string(ptr as *mut std::os::raw::c_char))
+        };
+
         let state_mutex = STREAM_STATE.get_or_init(|| Mutex::new(None));
         let mut guard = state_mutex.lock().unwrap();
         let Some(state) = guard.as_ref() else {
             return;
         };
 
-        if ptr.is_null() {
+        let Some(slice) = chunk else {
             emit_tool_calls(state);
             emit_event(state, AppleAIStreamEvent::Done);
             STREAM_ACTIVE.store(false, Ordering::SeqCst);
             *guard = None;
             return;
-        }
-
-        let slice = take_stream_string(ptr);
+        };
         if slice.is_empty() {
             return;
         }
@@ -685,17 +692,6 @@ mod macos {
         }
 
         emit_event(state, AppleAIStreamEvent::Text { text: slice });
-    }
-
-    fn take_stream_string(ptr: *const std::os::raw::c_char) -> String {
-        if ptr.is_null() {
-            return String::new();
-        }
-
-        unsafe {
-            let owned = CString::from_raw(ptr as *mut std::os::raw::c_char);
-            owned.to_string_lossy().into_owned()
-        }
     }
 
     fn emit_tool_calls(state: &StreamState) {
