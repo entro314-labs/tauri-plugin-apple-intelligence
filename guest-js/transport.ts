@@ -44,6 +44,12 @@ export type AppleIntelligenceErrorCode =
   | "unavailable"
   | "invalid-json"
   | "no-messages"
+  /** Private Cloud Compute request failed in transit — retryable (macOS 27+). */
+  | "network-failure"
+  /** Private Cloud Compute quota exhausted — the message carries the reset time when known. */
+  | "quota-exceeded"
+  /** Private Cloud Compute service is down — fall back to on-device (macOS 27+). */
+  | "service-unavailable"
   | "unknown"
   | (string & {});
 

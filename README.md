@@ -166,7 +166,9 @@ returns `-1` when a count can't be determined, `-2` on an OS without the tokeniz
 non-positive value as "unknown" rather than as a budget.
 
 Typed error codes mirror the FoundationModels error cases — `context-window-exceeded`,
-`guardrail-violation`, `refusal`, `rate-limited`, `concurrent-requests`, and more. Non-streaming
+`guardrail-violation`, `refusal`, `rate-limited`, `concurrent-requests`, and more; Private Cloud
+Compute failures map to `network-failure` (retryable), `quota-exceeded` (the message carries the
+reset time when known), and `service-unavailable` (fall back to on-device). Non-streaming
 commands reject with `{ type: "generation", code, message, contextSize?, tokenCount? }`; streams
 emit an `error` event with the same fields.
 

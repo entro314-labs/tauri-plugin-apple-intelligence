@@ -563,6 +563,28 @@ private func mapToBridgeError(_ error: Error) -> BridgeError {
     if isModelAssetLoadingFailure(error) {
         return BridgeError(code: "assets-unavailable", message: error.localizedDescription)
     }
+    // Private Cloud Compute failures are their own error type (macOS 27+). Without this mapping
+    // they surface as `unknown`, hiding the documented recovery paths (retry on network failure,
+    // back off until the quota reset, fall back to on-device while the service is down).
+    if #available(macOS 27.0, *),
+        let pccError = error as? PrivateCloudComputeLanguageModel.Error
+    {
+        let message = pccError.localizedDescription
+        switch pccError {
+        case .networkFailure:
+            return BridgeError(code: "network-failure", message: message)
+        case .quotaLimitReached(let info):
+            var detail = message
+            if let resetDate = info.resetDate {
+                detail += " Quota resets at \(ISO8601DateFormatter().string(from: resetDate))."
+            }
+            return BridgeError(code: "quota-exceeded", message: detail)
+        case .serviceUnavailable:
+            return BridgeError(code: "service-unavailable", message: message)
+        @unknown default:
+            return BridgeError(code: "unknown", message: message)
+        }
+    }
     if #available(macOS 27.0, *), let modelError = error as? LanguageModelError {
         let message = modelError.localizedDescription
         switch modelError {
@@ -723,25 +745,37 @@ private enum ConversationError: Error {
     case noMessages
 }
 
-private func prepareConversationContext(
-    messagesJsonString: String,
-    optionsJsonString: String?,
-    modelKind: ModelKind,
-    reasoningLevel: String?
-) throws -> ConversationContext {
-    if DEBUG_LOGS {
-        print("\n=== DEBUG: PARSING MESSAGES ===")
-        print("Messages JSON: \(messagesJsonString)")
+/// Refuse a request whose backing model cannot serve it. A `private-cloud` request that macOS 27
+/// with the entitlement will actually route to PCC is checked against PCC's own availability;
+/// everything else — on-device requests, and the macOS 26 fallback where `private-cloud` is
+/// served on-device — is checked against the on-device model.
+@available(macOS 26.0, *)
+private func assertModelAvailability(_ modelKind: ModelKind) throws {
+    if case .privateCloud = modelKind, #available(macOS 27.0, *) {
+        guard hasPrivateCloudComputeEntitlement else {
+            throw ConversationError.privateCloudUnavailable(
+                PRIVATE_CLOUD_COMPUTE_ENTITLEMENT_REASON)
+        }
+        switch PrivateCloudComputeLanguageModel().availability {
+        case .available:
+            return
+        case .unavailable(.deviceNotEligible):
+            throw ConversationError.intelligenceUnavailable(
+                "Device not eligible for Private Cloud Compute")
+        case .unavailable(.systemNotReady):
+            throw ConversationError.intelligenceUnavailable(
+                "Private Cloud Compute is not ready yet")
+        @unknown default:
+            throw ConversationError.intelligenceUnavailable("Private Cloud Compute is unavailable")
+        }
     }
 
-    // Check availability first
-    let model = SystemLanguageModel.default
-    let availability = model.availability
+    let availability = SystemLanguageModel.default.availability
     guard case .available = availability else {
         let reason: String
         switch availability {
         case .available:
-            reason = "Available"  // This case will never be reached due to guard
+            reason = "Available"  // Unreachable due to the guard.
         case .unavailable(let unavailableReason):
             switch unavailableReason {
             case .deviceNotEligible:
@@ -758,6 +792,24 @@ private func prepareConversationContext(
         }
         throw ConversationError.intelligenceUnavailable(reason)
     }
+}
+
+private func prepareConversationContext(
+    messagesJsonString: String,
+    optionsJsonString: String?,
+    modelKind: ModelKind,
+    reasoningLevel: String?
+) throws -> ConversationContext {
+    if DEBUG_LOGS {
+        print("\n=== DEBUG: PARSING MESSAGES ===")
+        print("Messages JSON: \(messagesJsonString)")
+    }
+
+    // Check availability of the model that will actually serve this request. Checking the
+    // on-device model for a Private Cloud Compute request answers the wrong question in both
+    // directions: it can refuse a serveable PCC request (on-device assets still downloading)
+    // and clear one PCC cannot serve.
+    try assertModelAvailability(modelKind)
 
     // Parse messages from JSON
     guard let messagesData = messagesJsonString.data(using: .utf8) else {
