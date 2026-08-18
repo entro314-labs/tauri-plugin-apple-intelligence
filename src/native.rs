@@ -62,7 +62,7 @@ mod macos {
         ) -> *mut std::os::raw::c_char;
     }
 
-    static INIT: OnceLock<()> = OnceLock::new();
+    static INIT: OnceLock<bool> = OnceLock::new();
     static STREAM_ACTIVE: AtomicBool = AtomicBool::new(false);
     /// Globally unique ids for tool definitions, so concurrent requests can never collide in
     /// [`TOOL_NAME_MAP`] (the old per-request `1..n` numbering meant two in-flight requests
@@ -115,12 +115,13 @@ mod macos {
     }
 
     fn ensure_initialized() -> Result<(), AppleAIError> {
-        INIT.get_or_init(|| unsafe {
-            if !apple_ai_init() {
-                panic!("Failed to initialize Apple Intelligence native library");
-            }
-        });
-        Ok(())
+        if *INIT.get_or_init(|| unsafe { apple_ai_init() }) {
+            Ok(())
+        } else {
+            Err(AppleAIError::NativeError {
+                message: "Failed to initialize the Apple Intelligence native library".into(),
+            })
+        }
     }
 
     fn take_c_string(ptr: *mut std::os::raw::c_char) -> String {

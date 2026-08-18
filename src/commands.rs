@@ -48,16 +48,27 @@ pub(crate) async fn cancel_stream(stream_id: String) -> Result<bool, AppleAIErro
     native::cancel_stream(&stream_id)
 }
 
+/// Blocks on a semaphore while an async framework task computes the answer — run it on the
+/// blocking pool like `generate`, so no async-runtime worker stalls behind it.
 #[command]
 pub(crate) async fn context_info(
     model: Option<String>,
 ) -> Result<AppleAIContextInfo, AppleAIError> {
-    native::context_info(model)
+    tauri::async_runtime::spawn_blocking(move || native::context_info(model))
+        .await
+        .map_err(|error| AppleAIError::NativeError {
+            message: format!("context info task failed: {error}"),
+        })?
 }
 
+/// Blocks on a semaphore while the tokenizer runs; see [`context_info`].
 #[command]
 pub(crate) async fn token_count(model: Option<String>, text: String) -> Result<i64, AppleAIError> {
-    native::token_count(model, text)
+    tauri::async_runtime::spawn_blocking(move || native::token_count(model, text))
+        .await
+        .map_err(|error| AppleAIError::NativeError {
+            message: format!("token count task failed: {error}"),
+        })?
 }
 
 #[command]
