@@ -380,7 +380,10 @@ mod macos {
         // (and the half-built state cleared, its tool ids returned) — otherwise every later
         // stream is refused with StreamBusy until the app restarts.
         stream_with_slot(emit, stream_id, request).inspect_err(|_| {
-            let mut guard = STREAM_STATE.get_or_init(|| Mutex::new(None)).lock().unwrap();
+            let mut guard = STREAM_STATE
+                .get_or_init(|| Mutex::new(None))
+                .lock()
+                .unwrap();
             if let Some(state) = guard.take() {
                 release_tool_ids(&state.tool_ids);
             }
