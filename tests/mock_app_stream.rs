@@ -45,6 +45,122 @@ fn request(prompt: &str) -> AppleAIGenerateRequest {
     }
 }
 
+/// The webview `stream` command takes its events channel as an invoke argument
+/// (`onEvent: "__CHANNEL__:<id>"`). This drives the real IPC deserialization path end-to-end on
+/// the MockRuntime: a mis-named argument or a Channel signature regression fails here, not first
+/// in a real app.
+#[test]
+#[ignore = "requires the on-device Apple Intelligence model — run locally with --ignored"]
+fn webview_stream_command_accepts_a_channel() {
+    let _slot = STREAM_SLOT
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    // The mock context ships an empty ACL, so the plugin commands under test are allowed
+    // explicitly (a real app grants them via the `apple-intelligence:default` permission).
+    let mut context = tauri::test::mock_context(tauri::test::noop_assets());
+    for command in ["stream", "cancel_stream"] {
+        context.runtime_authority_mut().__allow_command(
+            format!("plugin:apple-intelligence|{command}"),
+            tauri::utils::acl::ExecutionContext::Local,
+        );
+    }
+    let app = tauri::test::mock_builder()
+        .plugin(tauri_plugin_apple_intelligence::init())
+        .build(context)
+        .expect("mock app with plugin");
+    let webview = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
+        .build()
+        .expect("mock webview");
+
+    let availability = app
+        .handle()
+        .apple_intelligence()
+        .check_availability()
+        .expect("availability");
+    if !availability.available {
+        eprintln!("SKIP: model unavailable ({})", availability.reason);
+        return;
+    }
+
+    let body = serde_json::json!({
+        "request": {
+            "messages": [{"role": "user", "content": "Reply with exactly: ok"}],
+            "tools": null,
+            "schema": null,
+            "maxTokens": 16,
+            "temperature": null,
+            "stopAfterToolCalls": null,
+        },
+        "onEvent": "__CHANNEL__:1",
+    });
+    let response = tauri::test::get_ipc_response(
+        &webview,
+        tauri::webview::InvokeRequest {
+            cmd: "plugin:apple-intelligence|stream".into(),
+            callback: tauri::ipc::CallbackFn(0),
+            error: tauri::ipc::CallbackFn(1),
+            url: "tauri://localhost".parse().unwrap(),
+            body: body.into(),
+            headers: Default::default(),
+            invoke_key: tauri::test::INVOKE_KEY.to_string(),
+        },
+    )
+    .expect("stream command accepts a channel argument")
+    .deserialize::<serde_json::Value>()
+    .expect("stream start payload");
+    let stream_id = response
+        .get("streamId")
+        .and_then(|value| value.as_str())
+        .expect("stream start carries streamId")
+        .to_string();
+    eprintln!("channel-backed stream started: {stream_id}");
+
+    // Cancel through the same IPC surface, then wait for the slot to free (the cancelled task's
+    // terminal event releases it) so the next test can stream.
+    let _ = tauri::test::get_ipc_response(
+        &webview,
+        tauri::webview::InvokeRequest {
+            cmd: "plugin:apple-intelligence|cancel_stream".into(),
+            callback: tauri::ipc::CallbackFn(0),
+            error: tauri::ipc::CallbackFn(1),
+            url: "tauri://localhost".parse().unwrap(),
+            body: serde_json::json!({ "streamId": stream_id }).into(),
+            headers: Default::default(),
+            invoke_key: tauri::test::INVOKE_KEY.to_string(),
+        },
+    )
+    .expect("cancel command");
+
+    let ai = app.handle().apple_intelligence();
+    let deadline = Instant::now() + Duration::from_secs(90);
+    let second = loop {
+        match ai.stream(request("Reply with exactly: ok")) {
+            Ok(start) => break start,
+            Err(_) => {
+                assert!(
+                    Instant::now() < deadline,
+                    "the cancelled channel stream never released the slot"
+                );
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+    };
+    // Let the follow-up stream finish so the process exits with a quiet runtime.
+    let done = Arc::new(AtomicBool::new(false));
+    {
+        let done = Arc::clone(&done);
+        app.handle().listen(second.event_name.clone(), move |event| {
+            if event.payload().contains("\"done\"") || event.payload().contains("\"error\"") {
+                done.store(true, Ordering::SeqCst);
+            }
+        });
+    }
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !done.load(Ordering::SeqCst) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 #[test]
 #[ignore = "requires the on-device Apple Intelligence model — run locally with --ignored"]
 fn cancel_frees_the_stream_slot_and_emits_done() {
