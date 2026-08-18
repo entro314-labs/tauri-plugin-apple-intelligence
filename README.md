@@ -236,6 +236,11 @@ Shapes the framework cannot express are never quietly coerced into something els
 one is refused with the typed `unsupported-guide` code; an **optional** one is dropped from the
 guide and reported as a warning — see [Refused vs. omitted](#refused-vs-omitted).
 
+Structured generation defaults to a **1024 output-token cap** when no `maxTokens` is set: an
+uncapped guided generation can run away extending an unbounded string or array field until it
+overflows the context window (minutes of inference ending in `context-window-exceeded`). Pass an
+explicit `maxTokens` to raise the cap for genuinely large objects.
+
 ### Numbers, literals, and bounds
 
 Guided generation has no numeric-literal primitive, but `GenerationGuide` has numeric bounds, and a

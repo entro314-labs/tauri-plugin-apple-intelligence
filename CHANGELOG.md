@@ -42,4 +42,8 @@ together.
 
 ### Changed
 
+- **Structured generation defaults to a 1024 output-token cap** when the caller sets no
+  `maxTokens`. An uncapped guided generation could run away extending an unbounded field until
+  the context window overflowed (minutes of inference ending in `context-window-exceeded`). Pass
+  an explicit `maxTokens` for genuinely larger objects.
 - npm: removed the `ai` peer dependency — the provider only depends on `@ai-sdk/provider`.

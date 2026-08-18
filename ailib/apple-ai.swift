@@ -2653,6 +2653,15 @@ private func handleBasicModeStream(
     onChunk(nil)  // Signal end of stream
 }
 
+/// Default output-token cap for structured generation when the caller sets no `maxTokens`.
+///
+/// Guided generation with no cap can run away on some OS builds: the model keeps extending an
+/// unbounded string or array field until the transcript overflows the context window, failing
+/// with `context-window-exceeded` after minutes of inference. A well-formed structured answer to
+/// a realistic schema fits comfortably under this cap; a caller that genuinely needs a larger
+/// object passes an explicit `maxTokens`.
+private let STRUCTURED_DEFAULT_MAX_TOKENS = 1024
+
 @available(macOS 26.0, *)
 private func handleStructuredMode(
     context: ConversationContext,
@@ -2674,12 +2683,17 @@ private func handleStructuredMode(
     debugPrintTranscript(transcript, prompt: context.currentPrompt)
     let session = try makeSession(modelKind: context.modelKind, tools: [], transcript: transcript)
 
+    var options = context.options
+    if options.maximumResponseTokens == nil {
+        options.maximumResponseTokens = STRUCTURED_DEFAULT_MAX_TOKENS
+    }
+
     // Generate structured response
     let response = try await session.respond(
         to: context.currentPrompt,
         schema: generationSchema,
         includeSchemaInPrompt: true,
-        options: context.options
+        options: options
     )
 
     let generatedContent = response.content
