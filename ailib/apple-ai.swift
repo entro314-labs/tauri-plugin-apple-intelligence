@@ -706,6 +706,10 @@ private struct ConversationContext {
     let reasoningLevel: String?
     /// Images attached to the current user turn (multimodal input, macOS 27+).
     let images: [ImageInput]
+    /// The request's system prompt (all `system` messages, joined). Every mode injects it as the
+    /// transcript's leading `Transcript.Instructions` entry — tools mode additionally carries the
+    /// tool definitions on that same entry.
+    let systemContent: String
 }
 
 private enum ConversationError: Error {
@@ -794,6 +798,15 @@ private func prepareConversationContext(
     let historyMessages = lastIsUserPrompt ? Array(messages.dropLast()) : messages
     let transcriptEntries = convertMessagesToTranscript(historyMessages)
 
+    // System messages are filtered out of the transcript entries above; gather them here so every
+    // mode (basic, structured, tools) reinstates them as the leading Instructions entry. Dropping
+    // them was the old behavior for non-tool generations — a silent loss of the system prompt.
+    let systemContent = messages
+        .filter { $0.role.lowercased() == "system" }
+        .compactMap { $0.content }
+        .filter { !$0.isEmpty }
+        .joined(separator: "\n\n")
+
     // Decode generation options (temperature, sampling, token limits, tool choice).
     var optionsInput: GenerationOptionsInput? = nil
     if let optionsJsonString, !optionsJsonString.isEmpty {
@@ -812,8 +825,30 @@ private func prepareConversationContext(
         options: options,
         modelKind: modelKind,
         reasoningLevel: reasoningLevel,
-        images: currentImages
+        images: currentImages,
+        systemContent: systemContent
     )
+}
+
+/// The transcript for a request: the prior turns, preceded by an Instructions entry carrying the
+/// system prompt and (in tools mode) the tool definitions. `nil` instructions when there is nothing
+/// to instruct with — an empty Instructions entry adds noise, not signal.
+@available(macOS 26.0, *)
+private func makeTranscript(
+    context: ConversationContext,
+    toolDefinitions: [Transcript.ToolDefinition] = []
+) -> Transcript {
+    var entries = context.transcriptEntries
+    if !context.systemContent.isEmpty || !toolDefinitions.isEmpty {
+        let segments: [Transcript.Segment] =
+            context.systemContent.isEmpty
+            ? [] : [.text(Transcript.TextSegment(content: context.systemContent))]
+        entries.insert(
+            .instructions(
+                Transcript.Instructions(segments: segments, toolDefinitions: toolDefinitions)),
+            at: 0)
+    }
+    return Transcript(entries: entries)
 }
 
 private struct ChatMessage: Codable {
@@ -1019,14 +1054,6 @@ private func convertMessagesToTranscript(_ messages: [ChatMessage]) -> [Transcri
     }
 
     return entries
-}
-
-private func createInstructions(from message: ChatMessage) -> Transcript.Instructions {
-    let textSegment = Transcript.TextSegment(content: message.content ?? "")
-    return Transcript.Instructions(
-        segments: [.text(textSegment)],
-        toolDefinitions: []
-    )
 }
 
 private func createPrompt(from message: ChatMessage) -> Transcript.Prompt {
@@ -2339,7 +2366,6 @@ public func appleAIGenerateUnified(
                     result = try await handleToolsMode(
                         context: context,
                         toolsJsonString: toolsStr,
-                        messagesJsonString: messagesJsonString,
                         streaming: false,
                         stopAfterToolCalls: stopAfterToolCalls,
                         onChunk: nil
@@ -2387,7 +2413,6 @@ public func appleAIGenerateUnified(
                     _ = try await handleToolsMode(
                         context: context,
                         toolsJsonString: toolsStr,
-                        messagesJsonString: messagesJsonString,
                         streaming: true,
                         stopAfterToolCalls: stopAfterToolCalls,
                         onChunk: onChunk
@@ -2540,7 +2565,7 @@ private func streamDelta(previous: String, current: String) -> String {
 
 @available(macOS 26.0, *)
 private func handleBasicMode(context: ConversationContext) async throws -> String {
-    let transcript = Transcript(entries: context.transcriptEntries)
+    let transcript = makeTranscript(context: context)
     debugPrintTranscript(transcript, prompt: context.currentPrompt)
     let session = try makeSession(modelKind: context.modelKind, tools: [], transcript: transcript)
     let (text, usage) = try await respondText(session: session, context: context)
@@ -2557,7 +2582,7 @@ private func handleBasicModeStream(
     context: ConversationContext,
     onChunk: @convention(c) (UnsafePointer<CChar>?) -> Void
 ) async throws {
-    let transcript = Transcript(entries: context.transcriptEntries)
+    let transcript = makeTranscript(context: context)
     debugPrintTranscript(transcript, prompt: context.currentPrompt)
     let session = try makeSession(modelKind: context.modelKind, tools: [], transcript: transcript)
 
@@ -2597,7 +2622,7 @@ private func handleStructuredMode(
     let generationSchema = try GenerationSchema(root: rootSchema, dependencies: deps)
 
     // Create session without tools (structured generation doesn't use tools constructor)
-    let transcript = Transcript(entries: context.transcriptEntries)
+    let transcript = makeTranscript(context: context)
     debugPrintTranscript(transcript, prompt: context.currentPrompt)
     let session = try makeSession(modelKind: context.modelKind, tools: [], transcript: transcript)
 
@@ -2631,9 +2656,8 @@ private func handleStructuredMode(
 private func handleToolsMode(
     context: ConversationContext,
     toolsJsonString: String,
-    messagesJsonString: String,  // Added to extract system message
     streaming: Bool,
-    stopAfterToolCalls: Bool,  // New parameter
+    stopAfterToolCalls: Bool,
     onChunk: (@convention(c) (UnsafePointer<CChar>?) -> Void)?
 ) async throws -> String {
     // Parse tools
@@ -2663,42 +2687,15 @@ private func handleToolsMode(
         tools.append(proxy)
     }
 
-    // Build transcript with tools and system message
-    var finalEntries = context.transcriptEntries
-
-    // Extract system message content from original messages
-    var systemContent = ""
-    if let messagesData = messagesJsonString.data(using: .utf8),
-        let messagesJson = try? JSONSerialization.jsonObject(with: messagesData) as? [[String: Any]]
-    {
-        // Find system message (may not be first)
-        for message in messagesJson {
-            if let role = message["role"] as? String,
-                role.lowercased() == "system",
-                let content = message["content"] as? String
-            {
-                systemContent = content
-                break
-            }
-        }
-    }
-
-    // Create instructions with both system message and tools
-    if !tools.isEmpty || !systemContent.isEmpty {
-        let textSegment =
-            systemContent.isEmpty
-            ? [] : [Transcript.Segment.text(Transcript.TextSegment(content: systemContent))]
-        let instructions = Transcript.Instructions(
-            segments: textSegment,
-            toolDefinitions: tools.map { tool in
-                Transcript.ToolDefinition(
-                    name: tool.name, description: tool.description,
-                    parameters: tool.parameters)
-            })
-        finalEntries.insert(.instructions(instructions), at: 0)
-    }
-
-    let transcript = Transcript(entries: finalEntries)
+    // Build the transcript: prior turns behind an Instructions entry carrying the system prompt
+    // and the tool definitions.
+    let transcript = makeTranscript(
+        context: context,
+        toolDefinitions: tools.map { tool in
+            Transcript.ToolDefinition(
+                name: tool.name, description: tool.description,
+                parameters: tool.parameters)
+        })
     debugPrintTranscript(transcript, prompt: context.currentPrompt)
     let session = try makeSession(modelKind: context.modelKind, tools: tools, transcript: transcript)
 

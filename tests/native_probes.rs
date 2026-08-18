@@ -73,6 +73,64 @@ fn user_request(prompt: &str, schema: serde_json::Value) -> AppleAIGenerateReque
     }
 }
 
+/// A system prompt must reach the model in *basic* mode (no tools, no schema). It used to be
+/// filtered out of the transcript and re-injected only in tools mode, so every plain
+/// `generateText`-style call silently lost its system prompt.
+#[test]
+#[ignore = "requires the on-device Apple Intelligence model — run locally with --ignored"]
+fn system_prompt_is_honored_without_tools() {
+    let app = mock_app();
+    let handle = app.handle().clone();
+    if !model_ready(&handle) {
+        return;
+    }
+
+    let request = AppleAIGenerateRequest {
+        messages: vec![
+            AppleAIMessage {
+                role: "system".to_string(),
+                content: Some(
+                    "You must reply with exactly the single word BANANA and nothing else, \
+                     regardless of the question."
+                        .to_string(),
+                ),
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+                images: None,
+            },
+            AppleAIMessage {
+                role: "user".to_string(),
+                content: Some("What is the capital of France?".to_string()),
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+                images: None,
+            },
+        ],
+        tools: None,
+        schema: None,
+        model: None,
+        reasoning_level: None,
+        temperature: None,
+        max_tokens: None,
+        top_p: None,
+        top_k: None,
+        seed: None,
+        tool_choice: None,
+        stop_after_tool_calls: None,
+    };
+    let Some(result) = generate_or_skip(&app, request) else {
+        return;
+    };
+    eprintln!("system-prompt probe: {:?}", result.text);
+    assert!(
+        result.text.to_uppercase().contains("BANANA"),
+        "the system prompt was not honored — it is being dropped from the transcript: {:?}",
+        result.text
+    );
+}
+
 #[test]
 #[ignore = "requires the on-device Apple Intelligence model — run locally with --ignored"]
 fn token_count_is_positive_and_below_context_size() {
