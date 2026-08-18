@@ -20,7 +20,10 @@ fn mock_app() -> tauri::App<MockRuntime> {
 
 /// `true` when the on-device model can actually serve a request; probes skip otherwise.
 fn model_ready(app: &AppHandle<MockRuntime>) -> bool {
-    let availability = app.apple_intelligence().check_availability().expect("availability");
+    let availability = app
+        .apple_intelligence()
+        .check_availability()
+        .expect("availability");
     if !availability.available {
         eprintln!("SKIP: model unavailable ({})", availability.reason);
     }
@@ -194,14 +197,20 @@ fn nested_array_of_objects_is_not_self_recursive() {
     eprintln!("nested array probe: {object}");
 
     assert!(
-        object.get("title").and_then(|value| value.as_str()).is_some_and(|s| !s.is_empty()),
+        object
+            .get("title")
+            .and_then(|value| value.as_str())
+            .is_some_and(|s| !s.is_empty()),
         "the sibling field must be filled, not starved by the recursion: {object}"
     );
     let islands = object
         .get("islands")
         .and_then(|value| value.as_array())
         .expect("islands is an array");
-    assert!(!islands.is_empty(), "expected at least one island: {object}");
+    assert!(
+        !islands.is_empty(),
+        "expected at least one island: {object}"
+    );
     for island in islands {
         let entry = island.as_object().expect("each element is an object");
         assert!(
@@ -308,7 +317,10 @@ fn nullable_field_can_come_back_null() {
     eprintln!("nullable probe: {object}");
 
     assert!(
-        object.get("task").and_then(|value| value.as_str()).is_some_and(|s| !s.is_empty()),
+        object
+            .get("task")
+            .and_then(|value| value.as_str())
+            .is_some_and(|s| !s.is_empty()),
         "the sibling field must still be filled: {object}"
     );
     let assignee = object.get("assignee");
@@ -354,7 +366,10 @@ fn array_form_nullability_is_honored() {
     eprintln!("array-form nullable probe: {object}");
 
     assert!(
-        object.get("route").and_then(|value| value.as_str()).is_some_and(|s| !s.is_empty()),
+        object
+            .get("route")
+            .and_then(|value| value.as_str())
+            .is_some_and(|s| !s.is_empty()),
         "the sibling field must still be filled: {object}"
     );
     assert!(
@@ -401,11 +416,16 @@ fn openapi_nullable_flag_is_honored() {
     eprintln!("openapi nullable probe: {object}");
 
     assert!(
-        object.get("route").and_then(|value| value.as_str()).is_some_and(|s| !s.is_empty()),
+        object
+            .get("route")
+            .and_then(|value| value.as_str())
+            .is_some_and(|s| !s.is_empty()),
         "the sibling field must still be filled: {object}"
     );
     assert!(
-        object.get("delayMinutes").is_none_or(serde_json::Value::is_null),
+        object
+            .get("delayMinutes")
+            .is_none_or(serde_json::Value::is_null),
         "an OpenAPI-nullable field with nothing to report must come back null (or absent): {object}"
     );
 }
@@ -537,9 +557,10 @@ fn objects_with_declared_properties_ignore_the_open_part() {
         return;
     }
 
-    for (label, additional) in
-        [("closed", serde_json::json!(false)), ("open", serde_json::json!({}))]
-    {
+    for (label, additional) in [
+        ("closed", serde_json::json!(false)),
+        ("open", serde_json::json!({})),
+    ] {
         let request = user_request(
             "The ferry Blue Star leaves from Piraeus. Extract the ship and its port.",
             serde_json::json!({
@@ -559,7 +580,10 @@ fn objects_with_declared_properties_ignore_the_open_part() {
         eprintln!("{label} object probe: {object}");
         for key in ["ship", "port"] {
             assert!(
-                object.get(key).and_then(|value| value.as_str()).is_some_and(|s| !s.is_empty()),
+                object
+                    .get(key)
+                    .and_then(|value| value.as_str())
+                    .is_some_and(|s| !s.is_empty()),
                 "'{key}' must be filled for the {label} object: {object}"
             );
         }
@@ -677,10 +701,20 @@ fn homogeneous_tuple_becomes_a_fixed_length_array() {
     let object = result.object.expect("structured result carries an object");
     eprintln!("homogeneous tuple probe: {object}");
 
-    let stops = object.get("stops").and_then(|value| value.as_array()).expect("stops is an array");
-    assert_eq!(stops.len(), 3, "a 3-tuple must come back with exactly three members: {object}");
+    let stops = object
+        .get("stops")
+        .and_then(|value| value.as_array())
+        .expect("stops is an array");
+    assert_eq!(
+        stops.len(),
+        3,
+        "a 3-tuple must come back with exactly three members: {object}"
+    );
     for element in stops {
-        assert!(element.is_string(), "each member keeps the declared type: {object}");
+        assert!(
+            element.is_string(),
+            "each member keeps the declared type: {object}"
+        );
     }
 }
 
@@ -745,16 +779,27 @@ fn non_string_enums_and_numeric_bounds_are_honored() {
         [1.0, 2.0].contains(&number("berths")),
         "a union of numeric consts must constrain the answer: {object}"
     );
-    assert_eq!(number("version"), 42.0, "a numeric const must be pinned: {object}");
+    assert_eq!(
+        number("version"),
+        42.0,
+        "a numeric const must be pinned: {object}"
+    );
     let stars = number("stars");
-    assert!((1.0..=5.0).contains(&stars), "numeric bounds must be honored: {object}");
+    assert!(
+        (1.0..=5.0).contains(&stars),
+        "numeric bounds must be honored: {object}"
+    );
 
     let cabin = object.get("cabin").expect("cabin is present");
     assert!(
         cabin.as_str() == Some("deck") || cabin.as_f64() == Some(7.0),
         "a mixed string/number enum must constrain the answer to its members: {object}"
     );
-    assert_eq!(number("lane"), 3.0, "a literal reached through a `$ref` must be pinned: {object}");
+    assert_eq!(
+        number("lane"),
+        3.0,
+        "a literal reached through a `$ref` must be pinned: {object}"
+    );
 }
 
 /// The non-string constraints that stay unexpressible. A boolean literal cannot be pinned (there is
@@ -949,7 +994,10 @@ fn optional_unexpressible_properties_are_omitted_and_reported() {
     eprintln!("optional-omission probe: {object}");
 
     assert!(
-        object.get("title").and_then(|value| value.as_str()).is_some_and(|s| !s.is_empty()),
+        object
+            .get("title")
+            .and_then(|value| value.as_str())
+            .is_some_and(|s| !s.is_empty()),
         "the expressible properties must still be generated: {object}"
     );
     for dropped in ["frontmatter", "metadata"] {
@@ -959,7 +1007,9 @@ fn optional_unexpressible_properties_are_omitted_and_reported() {
         );
     }
 
-    let warnings = result.schema_warnings.expect("the omissions must be reported");
+    let warnings = result
+        .schema_warnings
+        .expect("the omissions must be reported");
     let report = warnings.join("\n");
     eprintln!("optional-omission warnings:\n{report}");
     for dropped in ["frontmatter", "metadata"] {
@@ -1002,7 +1052,9 @@ fn tool_schemas_keep_working_when_an_optional_property_is_unexpressible() {
         result.text, result.tool_calls
     );
 
-    let warnings = result.schema_warnings.expect("the omissions must be reported");
+    let warnings = result
+        .schema_warnings
+        .expect("the omissions must be reported");
     let report = warnings.join("\n");
     eprintln!("tool-omission warnings:\n{report}");
     assert!(
@@ -1045,10 +1097,7 @@ fn required_unexpressible_properties_are_still_refused() {
             "boolean literal",
             serde_json::json!({"type": "boolean", "const": true}),
         ),
-        (
-            "unknown type",
-            serde_json::json!({"type": "timestamp"}),
-        ),
+        ("unknown type", serde_json::json!({"type": "timestamp"})),
         (
             // Every property of this object is unexpressible, and none of them is required — so the
             // guide for it would carry no fields at all, which is the empty-object failure the
@@ -1125,14 +1174,25 @@ fn every_unexpressible_shape_is_droppable_when_optional() {
     let object = result.object.expect("structured result carries an object");
     eprintln!("droppable-shapes probe: {object}");
     assert!(
-        object.get("ship").and_then(|value| value.as_str()).is_some_and(|s| !s.is_empty()),
+        object
+            .get("ship")
+            .and_then(|value| value.as_str())
+            .is_some_and(|s| !s.is_empty()),
         "the expressible property must still be generated: {object}"
     );
 
-    let warnings = result.schema_warnings.expect("the omissions must be reported");
+    let warnings = result
+        .schema_warnings
+        .expect("the omissions must be reported");
     let report = warnings.join("\n");
     eprintln!("droppable-shapes warnings:\n{report}");
-    for dropped in ["openMap", "tuple", "intersection", "booleanLiteral", "unknownType"] {
+    for dropped in [
+        "openMap",
+        "tuple",
+        "intersection",
+        "booleanLiteral",
+        "unknownType",
+    ] {
         assert!(
             report.contains(dropped),
             "every dropped property must be named, missing '{dropped}': {report}"

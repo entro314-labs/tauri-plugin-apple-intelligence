@@ -48,7 +48,9 @@ fn request(prompt: &str) -> AppleAIGenerateRequest {
 #[test]
 #[ignore = "requires the on-device Apple Intelligence model — run locally with --ignored"]
 fn cancel_frees_the_stream_slot_and_emits_done() {
-    let _slot = STREAM_SLOT.lock().unwrap_or_else(|error| error.into_inner());
+    let _slot = STREAM_SLOT
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     let app = tauri::test::mock_builder()
         .plugin(tauri_plugin_apple_intelligence::init())
         .build(tauri::test::mock_context(tauri::test::noop_assets()))
@@ -143,7 +145,9 @@ fn cancel_frees_the_stream_slot_and_emits_done() {
 #[test]
 #[ignore = "requires the on-device Apple Intelligence model — run locally with --ignored"]
 fn dropped_tool_properties_are_reported_on_the_stream() {
-    let _slot = STREAM_SLOT.lock().unwrap_or_else(|error| error.into_inner());
+    let _slot = STREAM_SLOT
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     let app = tauri::test::mock_builder()
         .plugin(tauri_plugin_apple_intelligence::init())
         .build(tauri::test::mock_context(tauri::test::noop_assets()))
@@ -219,10 +223,15 @@ fn dropped_tool_properties_are_reported_on_the_stream() {
         "the dropped property must be reported on the stream: {seen:?}"
     );
     assert!(
-        reported.iter().any(|message| message.contains("frontmatter")),
+        reported
+            .iter()
+            .any(|message| message.contains("frontmatter")),
         "the report must name the dropped property: {reported:?}"
     );
-    let first_warning = seen.iter().position(|kind| kind == "warning").expect("warning event");
+    let first_warning = seen
+        .iter()
+        .position(|kind| kind == "warning")
+        .expect("warning event");
     let first_content = seen
         .iter()
         .position(|kind| kind == "text" || kind == "tool-call")
