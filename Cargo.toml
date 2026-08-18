@@ -1,6 +1,6 @@
 [package]
 name = "tauri-plugin-apple-intelligence"
-version = "0.11.0"
+version = "0.12.0"
 description = "Tauri plugin for Apple Intelligence (Foundation Models): on-device and Private Cloud Compute generation, streaming, tool calling, and capability queries"
 license = "MIT"
 readme = "README.md"
