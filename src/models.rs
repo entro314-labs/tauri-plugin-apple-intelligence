@@ -128,6 +128,9 @@ pub struct AppleAIAvailability {
     pub reason: String,
 }
 
+/// Handle for an in-flight stream. `stream_id` addresses `cancel_stream`. `event_name` is the
+/// app-event channel used by the Rust-side [`crate::AppleIntelligence::stream`] API; webview
+/// streams deliver over the invoke `Channel` instead and never emit app events.
 #[derive(Serialize, Deserialize, specta::Type, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct AppleAIStreamStart {

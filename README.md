@@ -34,8 +34,8 @@ tauri::Builder::default()
     .plugin(tauri_plugin_apple_intelligence::init())
 ```
 
-2. Allow it in your capability (streaming also needs the core event permissions, included in
-   `core:default`):
+2. Allow it in your capability (webview streams are delivered over an invoke `Channel`, so no
+   extra event permissions are needed):
 
 ```json
 // src-tauri/capabilities/default.json

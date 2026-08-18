@@ -279,10 +279,56 @@ mod macos {
         })
     }
 
+    /// Rust-side streaming: events are emitted on the app handle under
+    /// [`AppleAIStreamStart::event_name`].
     pub fn stream<R: tauri::Runtime>(
         app: AppHandle<R>,
         request: AppleAIGenerateRequest,
     ) -> Result<AppleAIStreamStart, AppleAIError> {
+        let stream_id = uuid::Uuid::new_v4().to_string();
+        let event_name = format!("apple-ai://stream/{stream_id}");
+        let emit_event_name = event_name.clone();
+        start_stream(
+            Box::new(move |event| {
+                let _ = app.emit(&emit_event_name, event);
+            }),
+            stream_id.clone(),
+            request,
+        )?;
+        Ok(AppleAIStreamStart {
+            stream_id,
+            event_name,
+        })
+    }
+
+    /// Webview streaming: events are delivered over the invoke `Channel` the guest created
+    /// *before* invoking, so no event — including an immediate terminal `error` — can be lost to
+    /// a listener-registration race (the failure mode of the old named-event transport). No app
+    /// events are emitted for channel-backed streams.
+    pub fn stream_to_channel(
+        channel: tauri::ipc::Channel<AppleAIStreamEvent>,
+        request: AppleAIGenerateRequest,
+    ) -> Result<AppleAIStreamStart, AppleAIError> {
+        let stream_id = uuid::Uuid::new_v4().to_string();
+        let event_name = format!("apple-ai://stream/{stream_id}");
+        start_stream(
+            Box::new(move |event| {
+                let _ = channel.send(event);
+            }),
+            stream_id.clone(),
+            request,
+        )?;
+        Ok(AppleAIStreamStart {
+            stream_id,
+            event_name,
+        })
+    }
+
+    fn start_stream(
+        emit: Box<dyn Fn(AppleAIStreamEvent) + Send + Sync>,
+        stream_id: String,
+        request: AppleAIGenerateRequest,
+    ) -> Result<(), AppleAIError> {
         ensure_initialized()?;
 
         if STREAM_ACTIVE.swap(true, Ordering::SeqCst) {
@@ -294,26 +340,21 @@ mod macos {
         // The slot is reserved. If setup fails before the native task spawns, it must be released
         // (and the half-built state cleared) — otherwise every later stream is refused with
         // StreamBusy until the app restarts.
-        stream_with_slot(app, request).inspect_err(|_| {
+        stream_with_slot(emit, stream_id, request).inspect_err(|_| {
             *STREAM_STATE.get_or_init(|| Mutex::new(None)).lock().unwrap() = None;
             STREAM_ACTIVE.store(false, Ordering::SeqCst);
         })
     }
 
-    /// The fallible part of [`stream`], run while the caller holds the single stream slot.
-    fn stream_with_slot<R: tauri::Runtime>(
-        app: AppHandle<R>,
+    /// The fallible part of [`start_stream`], run while the caller holds the single stream slot.
+    fn stream_with_slot(
+        emit: Box<dyn Fn(AppleAIStreamEvent) + Send + Sync>,
+        stream_id: String,
         request: AppleAIGenerateRequest,
-    ) -> Result<AppleAIStreamStart, AppleAIError> {
-        let stream_id = uuid::Uuid::new_v4().to_string();
-        let event_name = format!("apple-ai://stream/{stream_id}");
-
-        let emit_event_name = event_name.clone();
+    ) -> Result<(), AppleAIError> {
         let state = StreamState {
-            emit: Box::new(move |event| {
-                let _ = app.emit(&emit_event_name, event);
-            }),
-            stream_id: stream_id.clone(),
+            emit,
+            stream_id,
             cancel_requested: false,
         };
 
@@ -390,10 +431,7 @@ mod macos {
             );
         });
 
-        Ok(AppleAIStreamStart {
-            stream_id,
-            event_name,
-        })
+        Ok(())
     }
 
     pub fn cancel_stream(stream_id: &str) -> Result<bool, AppleAIError> {
@@ -733,6 +771,13 @@ mod stub {
 
     pub fn stream<R: tauri::Runtime>(
         _app: AppHandle<R>,
+        _request: AppleAIGenerateRequest,
+    ) -> Result<AppleAIStreamStart, AppleAIError> {
+        Err(AppleAIError::unsupported_platform())
+    }
+
+    pub fn stream_to_channel(
+        _channel: tauri::ipc::Channel<AppleAIStreamEvent>,
         _request: AppleAIGenerateRequest,
     ) -> Result<AppleAIStreamStart, AppleAIError> {
         Err(AppleAIError::unsupported_platform())

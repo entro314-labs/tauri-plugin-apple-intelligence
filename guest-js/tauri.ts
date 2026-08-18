@@ -1,5 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
+import { Channel, invoke } from "@tauri-apps/api/core";
 import type {
   AppleIntelligenceAvailability,
   AppleIntelligenceContextInfo,
@@ -14,6 +13,7 @@ import { toAppleIntelligenceError } from "./transport";
 
 type StreamStart = {
   streamId: string;
+  /** App-event name used by the Rust-side stream API; channel-backed webview streams ignore it. */
   eventName: string;
 };
 
@@ -76,10 +76,29 @@ export function createTauriAppleIntelligenceTransport(): AppleIntelligenceTransp
     ): AsyncIterable<AppleIntelligenceStreamEvent> {
       // The abort signal stays on this side of the IPC boundary — it is not serializable.
       const { abortSignal, ...payload } = request;
+
+      // The channel exists before the command is invoked, so every event the native side sends —
+      // including an immediate terminal `error` — is buffered for this iterator. The old
+      // named-event transport registered its listener only after the stream had started, so a
+      // fast first event could be lost and a lost terminal event hung the iterator forever.
+      const queue: AppleIntelligenceStreamEvent[] = [];
+      let pendingResolve: ((value: AppleIntelligenceStreamEvent) => void) | null =
+        null;
+      const channel = new Channel<AppleIntelligenceStreamEvent>();
+      channel.onmessage = (event) => {
+        if (pendingResolve) {
+          pendingResolve(event);
+          pendingResolve = null;
+        } else {
+          queue.push(event);
+        }
+      };
+
       let start: StreamStart;
       try {
         start = await invoke<StreamStart>(command("stream"), {
           request: payload,
+          onEvent: channel,
         });
       } catch (reason) {
         // Same normalization as generate(): surface typed failures (stream-busy, host
@@ -88,8 +107,8 @@ export function createTauriAppleIntelligenceTransport(): AppleIntelligenceTransp
       }
 
       // Abort → host-side cancel. The cancelled stream still terminates through its normal
-      // `done` event (emitted by the native cancellation handler), which ends the iterator and
-      // detaches the listener below; a stale abort after completion is a no-op on the host.
+      // `done` event (emitted by the native cancellation handler), which ends this iterator;
+      // a stale abort after completion is a no-op on the host.
       const cancel = () => {
         void invoke(command("cancel_stream"), { streamId: start.streamId });
       };
@@ -99,62 +118,21 @@ export function createTauriAppleIntelligenceTransport(): AppleIntelligenceTransp
         abortSignal?.addEventListener("abort", cancel, { once: true });
       }
 
-      const queue: AppleIntelligenceStreamEvent[] = [];
-      let done = false;
-      let pendingResolve:
-        | ((value: IteratorResult<AppleIntelligenceStreamEvent>) => void)
-        | null = null;
-
-      const unlisten = await listen<AppleIntelligenceStreamEvent>(
-        start.eventName,
-        (event) => {
-          const payload = event.payload;
-          if (pendingResolve) {
-            pendingResolve({ value: payload, done: false });
-            pendingResolve = null;
-          } else {
-            queue.push(payload);
-          }
-
-          if (payload.type === "done" || payload.type === "error") {
-            done = true;
-            unlisten();
-          }
-        }
-      );
-
       try {
         while (true) {
-          if (queue.length > 0) {
-            const value = queue.shift()!;
-            yield value;
-            if (value.type === "done" || value.type === "error") {
-              return;
-            }
-            continue;
-          }
-
-          if (done) {
+          const event =
+            queue.length > 0
+              ? queue.shift()!
+              : await new Promise<AppleIntelligenceStreamEvent>((resolve) => {
+                  pendingResolve = resolve;
+                });
+          yield event;
+          if (event.type === "done" || event.type === "error") {
             return;
-          }
-
-          const value = await new Promise<
-            IteratorResult<AppleIntelligenceStreamEvent>
-          >((resolve) => {
-            pendingResolve = resolve;
-          });
-
-          if (value.value) {
-            yield value.value;
-            if (value.value.type === "done" || value.value.type === "error") {
-              return;
-            }
           }
         }
       } finally {
-        if (!done) {
-          unlisten();
-        }
+        abortSignal?.removeEventListener("abort", cancel);
       }
     },
   } satisfies AppleIntelligenceTransport;

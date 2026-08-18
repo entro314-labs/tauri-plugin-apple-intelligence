@@ -1,7 +1,7 @@
 //! IPC command surface. Thin wrappers over [`crate::native`]; invoked from the webview as
 //! `plugin:apple-intelligence|<command>` (see `guest-js/tauri.ts`).
 
-use tauri::{AppHandle, Runtime, command};
+use tauri::command;
 
 use crate::error::AppleAIError;
 use crate::models::*;
@@ -31,12 +31,16 @@ pub(crate) async fn generate(
         })?
 }
 
+/// Streaming events are delivered over `on_event`, an invoke [`Channel`](tauri::ipc::Channel) the
+/// guest creates *before* invoking — so no event (including an immediate terminal `error`) can be
+/// lost to a listener-registration race. The Rust-side API ([`crate::AppleIntelligence::stream`])
+/// keeps emitting app events instead.
 #[command]
-pub(crate) async fn stream<R: Runtime>(
-    app: AppHandle<R>,
+pub(crate) async fn stream(
     request: AppleAIGenerateRequest,
+    on_event: tauri::ipc::Channel<AppleAIStreamEvent>,
 ) -> Result<AppleAIStreamStart, AppleAIError> {
-    native::stream(app, request)
+    native::stream_to_channel(on_event, request)
 }
 
 #[command]
