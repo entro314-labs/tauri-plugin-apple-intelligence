@@ -17,7 +17,7 @@ One repo, two artifacts:
 ```toml
 # src-tauri/Cargo.toml
 [dependencies]
-tauri-plugin-apple-intelligence = "0.8"
+tauri-plugin-apple-intelligence = "0.11"
 ```
 
 ```bash

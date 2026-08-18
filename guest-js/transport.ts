@@ -171,7 +171,7 @@ export type AppleIntelligenceImage = {
 };
 
 export type AppleIntelligenceMessage = {
-  role: "system" | "user" | "assistant" | "tool" | "tool_calls";
+  role: "system" | "user" | "assistant" | "tool";
   content?: string;
   name?: string;
   toolCallId?: string;

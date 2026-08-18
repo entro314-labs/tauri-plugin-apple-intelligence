@@ -49,9 +49,6 @@
     "@tauri-apps/api": "^2.11.1",
     "@types/json-schema": "^7.0.15"
   },
-  "peerDependencies": {
-    "ai": "^7.0.14"
-  },
   "devDependencies": {
     "ai": "^7.0.67",
     "rimraf": "^6.1.3",
