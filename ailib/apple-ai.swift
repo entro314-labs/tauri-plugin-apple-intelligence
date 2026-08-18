@@ -1323,6 +1323,11 @@ private struct JSProxyTool: Tool {
     let name: String
     let description: String
     let parametersSchema: GenerationSchema
+    /// This request's own collector — never shared, so a concurrent request's tool calls can
+    /// never leak into this one's result.
+    let collector: ToolCallCollector
+    /// This request's streaming coordinator; `nil` for non-streaming requests.
+    let coordinator: StreamingCoordinator?
 
     var parameters: GenerationSchema { parametersSchema }
 
@@ -1343,14 +1348,10 @@ private struct JSProxyTool: Tool {
         jsonStr.withCString { cb(toolID, $0) }
 
         // Collect this tool call for post-processing
-        if let argsDict = jsonObj as? [String: Any] {
-            ToolCallCollector.shared.append(id: toolID, name: name, arguments: argsDict)
-        } else {
-            ToolCallCollector.shared.append(id: toolID, name: name, arguments: [:])
-        }
+        collector.append(id: toolID, name: name, arguments: jsonObj as? [String: Any] ?? [:])
 
-        // Signal completion to streaming coordinator for early termination
-        await StreamingCoordinator.shared.toolCompleted()
+        // Signal completion to this request's streaming coordinator for early termination
+        await coordinator?.toolCompleted()
 
         // Return placeholder output to allow generation to continue naturally
         return "Tool call executed"
@@ -2251,9 +2252,11 @@ private func buildSchemasFromJson(_ json: [String: Any]) throws -> (
 
 // MARK: - Tool Call Collection for Natural Completion
 
+/// Per-request collector for the tool calls one generation makes. One instance per request —
+/// the old process-wide singleton let concurrent requests mix their tool calls into each
+/// other's results.
 @available(macOS 26.0, *)
-private class ToolCallCollector {
-    static let shared = ToolCallCollector()
+private final class ToolCallCollector: @unchecked Sendable {
     private let queue = DispatchQueue(label: "tool.call.collector")
     private var calls: [ToolCallRecord] = []
 
@@ -2262,10 +2265,6 @@ private class ToolCallCollector {
         let name: String
         let arguments: [String: Any]
         let callId: String
-    }
-
-    func reset() {
-        queue.sync { calls.removeAll() }
     }
 
     func append(id: UInt64, name: String, arguments: [String: Any]) {
@@ -2281,35 +2280,25 @@ private class ToolCallCollector {
 
 // MARK: - Streaming Coordinator for Early Termination
 
+/// Per-request early-termination signal for streaming tools mode. One instance per request —
+/// the old process-wide singleton let a concurrent request's tool completion prematurely
+/// terminate an unrelated stream.
 @available(macOS 26.0, *)
 private actor StreamingCoordinator {
-    static let shared = StreamingCoordinator()
+    private let shouldStopAfterTools: Bool
+    private var completedToolCount = 0
 
-    private var expectedToolCount: Int = 0
-    private var completedToolCount: Int = 0
-    private var shouldStopAfterTools: Bool = false
-    private var allToolsCompleted: Bool = false
-
-    func reset(expectedTools: Int, stopAfterToolCalls: Bool) {
-        expectedToolCount = expectedTools
-        completedToolCount = 0
+    init(stopAfterToolCalls: Bool) {
         shouldStopAfterTools = stopAfterToolCalls
-        allToolsCompleted = false
     }
 
     func toolCompleted() {
         completedToolCount += 1
-        // Mark completion on any tool call so we can stop immediately if configured
-        allToolsCompleted = true
     }
 
     func shouldTerminateStream() -> Bool {
         // Stop streaming as soon as at least one tool has been invoked when requested
-        return shouldStopAfterTools && completedToolCount > 0
-    }
-
-    func hasToolsToExecute() -> Bool {
-        return expectedToolCount > 0
+        shouldStopAfterTools && completedToolCount > 0
     }
 }
 
@@ -2674,6 +2663,11 @@ private func handleToolsMode(
         throw ConversationError.invalidJSON("Invalid tools JSON")
     }
 
+    // Per-request tool state: never shared across requests.
+    let collector = ToolCallCollector()
+    let coordinator: StreamingCoordinator? =
+        streaming ? StreamingCoordinator(stopAfterToolCalls: stopAfterToolCalls) : nil
+
     // Build tools
     var tools: [any Tool] = []
     // Parameters a tool declares but its guide could not carry (optional properties whose shape
@@ -2689,7 +2683,8 @@ private func handleToolsMode(
         schemaWarnings.append(contentsOf: warnings.map { "Tool \"\(name)\": \($0)" })
         let genSchema = try GenerationSchema(root: root, dependencies: deps)
         let proxy = JSProxyTool(
-            toolID: idNum, name: name, description: description, parametersSchema: genSchema
+            toolID: idNum, name: name, description: description, parametersSchema: genSchema,
+            collector: collector, coordinator: coordinator
         )
         tools.append(proxy)
     }
@@ -2706,14 +2701,11 @@ private func handleToolsMode(
     debugPrintTranscript(transcript, prompt: context.currentPrompt)
     let session = try makeSession(modelKind: context.modelKind, tools: tools, transcript: transcript)
 
-    // Reset tool call collection
-    ToolCallCollector.shared.reset()
-
     if !streaming {
         // Non-streaming with tools. `respondText` honors reasoning level / image attachments and
-        // reads token usage; tool calls are gathered as a side effect via ToolCallCollector.
+        // reads token usage; tool calls are gathered as a side effect via this request's collector.
         let (text, usage) = try await respondText(session: session, context: context)
-        let toolCalls = ToolCallCollector.shared.getAllCalls()
+        let toolCalls = collector.getAllCalls()
 
         var json: [String: Any] = [:]
         if let usage { json["usage"] = usage.jsonObject }
@@ -2753,23 +2745,17 @@ private func handleToolsMode(
             emitWarning(warning, to: onChunk)
         }
 
-        // Initialize coordination with configurable early termination
-        await StreamingCoordinator.shared.reset(
-            expectedTools: tools.count,
-            stopAfterToolCalls: stopAfterToolCalls  // Use the parameter
-        )
-
         var prev = ""
         for try await cumulative in makeTextStream(session: session, context: context) {
             // Observe cancellation between chunks even if the framework's sequence is slow to.
             try Task.checkCancellation()
 
             // Check for early termination only if enabled
-            if stopAfterToolCalls {
-                let shouldTerminate = await StreamingCoordinator.shared.shouldTerminateStream()
-                if shouldTerminate {
-                    break
-                }
+            if stopAfterToolCalls,
+                let coordinator,
+                await coordinator.shouldTerminateStream()
+            {
+                break
             }
 
             let delta = streamDelta(previous: prev, current: cumulative.content)

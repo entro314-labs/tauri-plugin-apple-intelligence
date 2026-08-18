@@ -64,7 +64,10 @@ mod macos {
 
     static INIT: OnceLock<()> = OnceLock::new();
     static STREAM_ACTIVE: AtomicBool = AtomicBool::new(false);
-    static TOOL_CALLS: OnceLock<Mutex<Vec<(String, String, serde_json::Value)>>> = OnceLock::new();
+    /// Globally unique ids for tool definitions, so concurrent requests can never collide in
+    /// [`TOOL_NAME_MAP`] (the old per-request `1..n` numbering meant two in-flight requests
+    /// resolved each other's tool names).
+    static TOOL_ID_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     static TOOL_NAME_MAP: OnceLock<Mutex<std::collections::HashMap<u64, String>>> = OnceLock::new();
     static STREAM_STATE: OnceLock<Mutex<Option<StreamState>>> = OnceLock::new();
 
@@ -80,6 +83,35 @@ mod macos {
         /// chunk (closing the startup race where the Swift task wasn't registered yet) and stops
         /// emitting text the consumer already abandoned.
         cancel_requested: bool,
+        /// Ids of THIS stream's tool definitions. `tool_callback` buffers a call into
+        /// [`Self::tool_calls`] only when its id belongs here — a concurrent non-streaming
+        /// generate's tool calls return through its own JSON result, not this stream.
+        tool_ids: Vec<u64>,
+        /// Tool calls collected for this stream, emitted as `tool-call` events at end-of-stream.
+        tool_calls: Vec<(String, String, serde_json::Value)>,
+    }
+
+    /// Remove a finished request's tool ids from the shared name map.
+    fn release_tool_ids(ids: &[u64]) {
+        if ids.is_empty() {
+            return;
+        }
+        if let Some(map) = TOOL_NAME_MAP.get() {
+            let mut guard = map.lock().unwrap();
+            for id in ids {
+                guard.remove(id);
+            }
+        }
+    }
+
+    /// Releases its tool ids from [`TOOL_NAME_MAP`] on drop, so every exit path of a request
+    /// returns them. Defuse by `std::mem::take`-ing the ids out (e.g. to hand them to a
+    /// [`StreamState`], which then owns the cleanup).
+    struct ToolIdsGuard(Vec<u64>);
+    impl Drop for ToolIdsGuard {
+        fn drop(&mut self) {
+            release_tool_ids(&self.0);
+        }
     }
 
     fn ensure_initialized() -> Result<(), AppleAIError> {
@@ -184,7 +216,13 @@ mod macos {
             serde_json::to_string(&request.messages).map_err(|e| AppleAIError::InvalidPayload {
                 message: e.to_string(),
             })?;
-        let tools_json = serialize_tools(&request.tools)?;
+        let serialized_tools = serialize_tools(&request.tools)?;
+        let (tools_json, tool_ids) = match serialized_tools {
+            Some((json, ids)) => (Some(json), ids),
+            None => (None, Vec::new()),
+        };
+        // Released when this request returns, on every path.
+        let _tool_ids = ToolIdsGuard(tool_ids);
         let schema_json = request
             .schema
             .as_ref()
@@ -338,10 +376,14 @@ mod macos {
         }
 
         // The slot is reserved. If setup fails before the native task spawns, it must be released
-        // (and the half-built state cleared) — otherwise every later stream is refused with
-        // StreamBusy until the app restarts.
+        // (and the half-built state cleared, its tool ids returned) — otherwise every later
+        // stream is refused with StreamBusy until the app restarts.
         stream_with_slot(emit, stream_id, request).inspect_err(|_| {
-            *STREAM_STATE.get_or_init(|| Mutex::new(None)).lock().unwrap() = None;
+            let mut guard = STREAM_STATE.get_or_init(|| Mutex::new(None)).lock().unwrap();
+            if let Some(state) = guard.take() {
+                release_tool_ids(&state.tool_ids);
+            }
+            drop(guard);
             STREAM_ACTIVE.store(false, Ordering::SeqCst);
         })
     }
@@ -352,31 +394,18 @@ mod macos {
         stream_id: String,
         request: AppleAIGenerateRequest,
     ) -> Result<(), AppleAIError> {
-        let state = StreamState {
-            emit,
-            stream_id,
-            cancel_requested: false,
-        };
-
-        let state_mutex = STREAM_STATE.get_or_init(|| Mutex::new(None));
-        *state_mutex.lock().unwrap() = Some(state);
-
-        TOOL_CALLS
-            .get_or_init(|| Mutex::new(Vec::new()))
-            .lock()
-            .unwrap()
-            .clear();
-        TOOL_NAME_MAP
-            .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
-            .lock()
-            .unwrap()
-            .clear();
-
         let messages_json =
             serde_json::to_string(&request.messages).map_err(|e| AppleAIError::InvalidPayload {
                 message: e.to_string(),
             })?;
-        let tools_json = serialize_tools(&request.tools)?;
+        // The registered ids are guarded until they are handed to the StreamState below, so a
+        // setup failure in between cannot leak them into TOOL_NAME_MAP.
+        let serialized_tools = serialize_tools(&request.tools)?;
+        let (tools_json, tool_ids) = match serialized_tools {
+            Some((json, ids)) => (Some(json), ids),
+            None => (None, Vec::new()),
+        };
+        let mut tool_ids = ToolIdsGuard(tool_ids);
         let schema_json = request
             .schema
             .as_ref()
@@ -404,6 +433,16 @@ mod macos {
         let c_model = optional_cstring(request.model.as_deref())?;
         let c_reasoning = optional_cstring(request.reasoning_level.as_deref())?;
         let c_options = serialize_options(&request)?;
+
+        let state = StreamState {
+            emit,
+            stream_id,
+            cancel_requested: false,
+            tool_ids: std::mem::take(&mut tool_ids.0),
+            tool_calls: Vec::new(),
+        };
+        let state_mutex = STREAM_STATE.get_or_init(|| Mutex::new(None));
+        *state_mutex.lock().unwrap() = Some(state);
 
         if request.tools.as_ref().is_some_and(|t| !t.is_empty()) {
             register_tool_callback();
@@ -560,9 +599,12 @@ mod macos {
         serde_json::from_value(value.clone()).ok()
     }
 
+    /// Serialize a request's tools for the Swift bridge, registering each under a globally unique
+    /// id in [`TOOL_NAME_MAP`]. Returns the JSON payload plus the allocated ids — the caller must
+    /// hand the ids to [`release_tool_ids`] when the request finishes.
     fn serialize_tools(
         tools: &Option<Vec<AppleAIToolDefinition>>,
-    ) -> Result<Option<String>, AppleAIError> {
+    ) -> Result<Option<(String, Vec<u64>)>, AppleAIError> {
         let Some(tools) = tools else {
             return Ok(None);
         };
@@ -570,19 +612,25 @@ mod macos {
             return Ok(None);
         }
 
+        let ids: Vec<u64> = tools
+            .iter()
+            .map(|_| TOOL_ID_COUNTER.fetch_add(1, Ordering::Relaxed))
+            .collect();
+
         let map = TOOL_NAME_MAP.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
-        let mut guard = map.lock().unwrap();
-        guard.clear();
-        for (index, tool) in tools.iter().enumerate() {
-            guard.insert((index + 1) as u64, tool.name.clone());
+        {
+            let mut guard = map.lock().unwrap();
+            for (id, tool) in ids.iter().zip(tools) {
+                guard.insert(*id, tool.name.clone());
+            }
         }
 
         let payload: Vec<serde_json::Value> = tools
             .iter()
-            .enumerate()
-            .map(|(index, tool)| {
+            .zip(&ids)
+            .map(|(tool, id)| {
                 json!({
-                    "id": index + 1,
+                    "id": id,
                     "name": tool.name,
                     "description": tool.description,
                     "parameters": tool.parameters,
@@ -590,11 +638,15 @@ mod macos {
             })
             .collect();
 
-        serde_json::to_string(&payload)
-            .map(Some)
-            .map_err(|e| AppleAIError::InvalidPayload {
-                message: e.to_string(),
-            })
+        match serde_json::to_string(&payload) {
+            Ok(json) => Ok(Some((json, ids))),
+            Err(e) => {
+                release_tool_ids(&ids);
+                Err(AppleAIError::InvalidPayload {
+                    message: e.to_string(),
+                })
+            }
+        }
     }
 
     fn register_tool_callback() {
@@ -621,11 +673,14 @@ mod macos {
             })
             .unwrap_or_else(|| format!("tool-{tool_id}"));
 
-        if let Some(store) = TOOL_CALLS.get() {
-            store
-                .lock()
-                .unwrap()
-                .push((call_id, tool_name, args.clone()));
+        // Buffer the call for the stream that owns this tool id. A concurrent non-streaming
+        // generate's tool calls return through its own JSON result and must not leak onto an
+        // unrelated stream's event channel.
+        let state_mutex = STREAM_STATE.get_or_init(|| Mutex::new(None));
+        if let Some(state) = state_mutex.lock().unwrap().as_mut()
+            && state.tool_ids.contains(&tool_id)
+        {
+            state.tool_calls.push((call_id, tool_name, args));
         }
 
         let result = CString::new("{}").unwrap();
@@ -651,7 +706,7 @@ mod macos {
 
         let state_mutex = STREAM_STATE.get_or_init(|| Mutex::new(None));
         let mut guard = state_mutex.lock().unwrap();
-        let Some(state) = guard.as_ref() else {
+        let Some(state) = guard.as_mut() else {
             return;
         };
 
@@ -659,7 +714,9 @@ mod macos {
             emit_tool_calls(state);
             emit_event(state, AppleAIStreamEvent::Done);
             STREAM_ACTIVE.store(false, Ordering::SeqCst);
-            *guard = None;
+            if let Some(finished) = guard.take() {
+                release_tool_ids(&finished.tool_ids);
+            }
             return;
         };
         if slice.is_empty() {
@@ -696,7 +753,9 @@ mod macos {
                 };
                 emit_event(state, event);
                 STREAM_ACTIVE.store(false, Ordering::SeqCst);
-                *guard = None;
+                if let Some(finished) = guard.take() {
+                    release_tool_ids(&finished.tool_ids);
+                }
                 return;
             }
             Some(&USAGE_SENTINEL) => {
@@ -732,20 +791,17 @@ mod macos {
         emit_event(state, AppleAIStreamEvent::Text { text: slice });
     }
 
-    fn emit_tool_calls(state: &StreamState) {
-        if let Some(store) = TOOL_CALLS.get() {
-            let mut calls = store.lock().unwrap();
-            let drained: Vec<_> = calls.drain(..).collect();
-            for (id, name, args) in drained {
-                emit_event(
-                    state,
-                    AppleAIStreamEvent::ToolCall {
-                        tool_call_id: id,
-                        tool_name: name,
-                        args,
-                    },
-                );
-            }
+    fn emit_tool_calls(state: &mut StreamState) {
+        let drained: Vec<_> = state.tool_calls.drain(..).collect();
+        for (id, name, args) in drained {
+            emit_event(
+                state,
+                AppleAIStreamEvent::ToolCall {
+                    tool_call_id: id,
+                    tool_name: name,
+                    args,
+                },
+            );
         }
     }
 
