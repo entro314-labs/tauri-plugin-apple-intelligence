@@ -6,6 +6,12 @@ together.
 
 ## [Unreleased]
 
+## [0.12.1] - 2026-09-26
+
+### Fixed
+
+- On macOS 27.2, debug transcript logging now shows binary attachment entries (images, files) as `DATA (omitted)`. Before, they appeared as `UNKNOWN_ENTRY`. Building the Swift library from source against the macOS 27.2 SDK also no longer warns that a `switch` is not exhaustive. The prebuilt library includes this change. ([98140be](https://github.com/entro314-labs/tauri-plugin-apple-intelligence/commit/98140be))
+
 ## [0.12.0] - 2026-08-18
 
 ### Fixed
@@ -49,3 +55,7 @@ together.
   the context window overflowed (minutes of inference ending in `context-window-exceeded`). Pass
   an explicit `maxTokens` for genuinely larger objects.
 - npm: removed the `ai` peer dependency — the provider only depends on `@ai-sdk/provider`.
+
+[Unreleased]: https://github.com/entro314-labs/tauri-plugin-apple-intelligence/compare/v0.12.1...HEAD
+[0.12.1]: https://github.com/entro314-labs/tauri-plugin-apple-intelligence/compare/v0.12.0...v0.12.1
+[0.12.0]: https://github.com/entro314-labs/tauri-plugin-apple-intelligence/releases/tag/v0.12.0
