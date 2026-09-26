@@ -6,6 +6,13 @@ together.
 
 ## [Unreleased]
 
+## [0.12.2] - 2026-09-26
+
+### Fixed
+
+- On macOS 27.2, debug transcript logging now shows binary attachment entries (images, files) as `DATA (omitted)`. Before, they showed as `UNKNOWN_ENTRY`. Building the Swift library from source against the macOS 27.2 SDK also no longer warns that a `switch` is not exhaustive. The prebuilt library includes this change. This fix was listed under 0.12.1, but that release's publish failed, so 0.12.2 is the first published release that includes it. ([98140be](https://github.com/entro314-labs/tauri-plugin-apple-intelligence/commit/98140be))
+- The JavaScript package's type declarations build again with tsdown 0.23. The failed build is what stopped 0.12.1 from being published. ([f6ee8c4](https://github.com/entro314-labs/tauri-plugin-apple-intelligence/commit/f6ee8c4))
+
 ## [0.12.1] - 2026-09-26
 
 ### Fixed
@@ -56,6 +63,7 @@ together.
   an explicit `maxTokens` for genuinely larger objects.
 - npm: removed the `ai` peer dependency — the provider only depends on `@ai-sdk/provider`.
 
-[Unreleased]: https://github.com/entro314-labs/tauri-plugin-apple-intelligence/compare/v0.12.1...HEAD
+[Unreleased]: https://github.com/entro314-labs/tauri-plugin-apple-intelligence/compare/v0.12.2...HEAD
+[0.12.2]: https://github.com/entro314-labs/tauri-plugin-apple-intelligence/compare/v0.12.1...v0.12.2
 [0.12.1]: https://github.com/entro314-labs/tauri-plugin-apple-intelligence/compare/v0.12.0...v0.12.1
 [0.12.0]: https://github.com/entro314-labs/tauri-plugin-apple-intelligence/releases/tag/v0.12.0
