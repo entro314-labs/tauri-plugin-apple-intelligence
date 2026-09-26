@@ -469,6 +469,10 @@ private func describeTranscriptEntry(_ entry: Transcript.Entry) -> String {
         // macOS 27: the model can emit chain-of-thought entries in the transcript.
         return "REASONING (omitted)"
 
+    case .data:
+        // macOS 27.2: binary attachments (images, files) carried as transcript entries.
+        return "DATA (omitted)"
+
     @unknown default:
         return "UNKNOWN_ENTRY"
     }
