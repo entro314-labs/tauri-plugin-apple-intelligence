@@ -10,16 +10,18 @@ edition = "2024"
 rust-version = "1.98.1"
 keywords = ["tauri", "plugin", "apple-intelligence", "foundation-models", "on-device"]
 links = "tauri-plugin-apple-intelligence"
+# Anchored with a leading `/`: `include` uses gitignore semantics, so an unanchored "README.md" or
+# "LICENSE" also matches every copy under node_modules/ and would ship them in the crate.
 include = [
-	"src/**",
-	"build.rs",
-	"permissions/**",
-	"prebuilt/**",
-	"ailib/**",
-	"scripts/**",
-	"Cargo.toml",
-	"README.md",
-	"LICENSE",
+	"/src/**",
+	"/build.rs",
+	"/permissions/**",
+	"/prebuilt/**",
+	"/ailib/**",
+	"/scripts/**",
+	"/Cargo.toml",
+	"/README.md",
+	"/LICENSE",
 ]
 
 [dependencies]
