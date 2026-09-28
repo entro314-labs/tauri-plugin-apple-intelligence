@@ -29,6 +29,7 @@ together.
 
 ### Removed
 
+- The `reasoning` stream event (Rust `AppleAIStreamEvent::Reasoning`, TS `{ type: "reasoning" }`). It was reserved but never emitted. The on-device model can't reason, and whether Private Cloud Compute exposes readable reasoning text can't be checked without its restricted entitlement. Reasoning token counts are still reported in `usage`.
 - `AppleAIError::StreamBusy`. Streams no longer block each other.
 
 - `AppleAIStreamStart::event_name` (Rust) and `eventName` (TS). Streams no longer emit app events.

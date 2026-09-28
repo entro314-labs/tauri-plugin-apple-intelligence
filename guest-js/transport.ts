@@ -260,7 +260,6 @@ export type AppleIntelligenceGenerateResult = {
 
 export type AppleIntelligenceStreamEvent =
   | { type: "text"; text: string }
-  | { type: "reasoning"; text: string }
   | {
       type: "tool-call";
       toolCallId: string;

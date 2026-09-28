@@ -148,8 +148,6 @@ pub struct AppleAIStreamStart {
 pub enum AppleAIStreamEvent {
     #[serde(rename = "text")]
     Text { text: String },
-    #[serde(rename = "reasoning")]
-    Reasoning { text: String },
     #[serde(rename = "tool-call")]
     ToolCall {
         tool_call_id: String,

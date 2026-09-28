@@ -897,9 +897,7 @@ export class AppleIntelligenceChatLanguageModel implements LanguageModelV4 {
     return new ReadableStream<LanguageModelV4StreamPart>({
       async start(controller) {
         const textId = newId();
-        const reasoningId = newId();
         let hasText = false;
-        let hasReasoning = false;
         let hasToolCalls = false;
         let usage = createNullLanguageModelUsage();
 
@@ -917,11 +915,7 @@ export class AppleIntelligenceChatLanguageModel implements LanguageModelV4 {
           controller.enqueue({ type: "stream-start", warnings: pendingWarnings });
         };
 
-        const closeOpenBlocks = () => {
-          if (hasReasoning) {
-            controller.enqueue({ type: "reasoning-end", id: reasoningId });
-            hasReasoning = false;
-          }
+        const closeTextBlock = () => {
           if (hasText) {
             controller.enqueue({ type: "text-end", id: textId });
             hasText = false;
@@ -945,19 +939,6 @@ export class AppleIntelligenceChatLanguageModel implements LanguageModelV4 {
                 delta: event.text,
                 id: textId,
               });
-            } else if (event.type === "reasoning") {
-              if (!hasReasoning) {
-                controller.enqueue({
-                  type: "reasoning-start",
-                  id: reasoningId,
-                });
-                hasReasoning = true;
-              }
-              controller.enqueue({
-                type: "reasoning-delta",
-                delta: event.text,
-                id: reasoningId,
-              });
             } else if (event.type === "tool-call") {
               hasToolCalls = true;
               controller.enqueue({
@@ -971,7 +952,7 @@ export class AppleIntelligenceChatLanguageModel implements LanguageModelV4 {
             } else if (event.type === "error") {
               const error = new AppleIntelligenceGenerationError(event);
               if (error.isContentFiltered) {
-                closeOpenBlocks();
+                closeTextBlock();
                 controller.enqueue({
                   type: "finish",
                   finishReason: contentFilterFinish(error.code),
@@ -987,7 +968,7 @@ export class AppleIntelligenceChatLanguageModel implements LanguageModelV4 {
             }
           }
 
-          closeOpenBlocks();
+          closeTextBlock();
 
           // A stream that produced nothing at all still has to start before it finishes.
           ensureStarted();

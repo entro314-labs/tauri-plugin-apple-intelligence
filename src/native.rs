@@ -453,7 +453,6 @@ mod macos {
     // Streaming chunk tags — must match the Swift bridge's table. Untagged chunks are plain
     // answer-text deltas; a null chunk is the clean end-of-stream.
     const ERROR_SENTINEL: u8 = 0x02;
-    const REASONING_SENTINEL: u8 = 0x03;
     const USAGE_SENTINEL: u8 = 0x04;
     const WARNING_SENTINEL: u8 = 0x05;
     const TOOL_CALLS_SENTINEL: u8 = 0x06;
@@ -505,9 +504,6 @@ mod macos {
                 if let Ok(usage) = serde_json::from_slice::<AppleAIUsage>(&chunk[1..]) {
                     (state.emit)(AppleAIStreamEvent::Usage { usage });
                 }
-            }
-            Some(&REASONING_SENTINEL) => {
-                (state.emit)(AppleAIStreamEvent::Reasoning { text: payload() });
             }
             Some(&WARNING_SENTINEL) => {
                 // Non-fatal: the stream continues. Sent ahead of the first answer token.

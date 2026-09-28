@@ -1393,7 +1393,7 @@ private func createToolOutputEntry(from message: ChatMessage) -> [Transcript.Ent
 // answer-text deltas. The Rust host decodes the same table:
 //   0x02  error       — the remainder is a JSON error object: {code, message, contextSize?,
 //                       tokenCount?}. Terminal: nothing follows it.
-//   0x03  reasoning   — the remainder is a reasoning/chain-of-thought text delta (reserved)
+//   0x03  (retired: was reserved for reasoning deltas, which the bridge never produced)
 //   0x04  usage       — the remainder is a JSON usage object, sent once before end-of-stream
 //   0x05  warning     — the remainder is a plain-text warning (a setting the model cannot apply,
 //                       or a property dropped from a tool's guide), sent before the first answer
@@ -1402,7 +1402,6 @@ private func createToolOutputEntry(from message: ChatMessage) -> [Transcript.Ent
 //                       shape as the non-streaming result's `toolCalls`, sent before end-of-stream
 // A nil chunk is the clean end-of-stream. Every stream ends with exactly one nil or error chunk.
 private let ERROR_SENTINEL: Character = "\u{0002}"
-private let REASONING_SENTINEL: Character = "\u{0003}"
 private let USAGE_SENTINEL: Character = "\u{0004}"
 private let WARNING_SENTINEL: Character = "\u{0005}"
 private let TOOL_CALLS_SENTINEL: Character = "\u{0006}"
