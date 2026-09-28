@@ -279,8 +279,8 @@ mod macos {
             .and_then(|value| serde_json::from_value(value).ok());
         let object = parsed.get("object").cloned();
         let usage = parsed.get("usage").and_then(parse_usage);
-        let schema_warnings = parsed
-            .get("schemaWarnings")
+        let warnings = parsed
+            .get("warnings")
             .cloned()
             .and_then(|value| serde_json::from_value::<Vec<String>>(value).ok())
             .filter(|warnings| !warnings.is_empty());
@@ -290,7 +290,7 @@ mod macos {
             tool_calls,
             object,
             usage,
-            schema_warnings,
+            warnings,
         })
     }
 

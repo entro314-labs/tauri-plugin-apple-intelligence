@@ -99,14 +99,12 @@ function convertUsage(usage?: AppleIntelligenceUsage): LanguageModelV4Usage {
 }
 
 /**
- * Fold the native schema-omission reports into the call's warnings.
- *
- * A property whose shape Apple's guided generation cannot express is dropped from the guide when
- * the schema does not require it — the tool keeps working, minus a field nothing could have filled.
- * Surfacing it here is what keeps that from being a silent degradation: it shows up wherever the
- * AI SDK surfaces warnings (`result.warnings`, and the console warning the SDK logs by default).
+ * Fold the native side's reports — settings it could not apply, schema properties it had to drop
+ * from a guide — into the call's warnings. Surfacing them is what keeps those from being silent
+ * degradations: they show up wherever the AI SDK surfaces warnings (`result.warnings`, and the
+ * console warning the SDK logs by default).
  */
-function withSchemaWarnings(
+function withNativeWarnings(
   warnings: SharedV4Warning[],
   messages: string[] | undefined
 ): SharedV4Warning[] {
@@ -547,7 +545,7 @@ export class AppleIntelligenceChatLanguageModel implements LanguageModelV4 {
       content: [{ type: "text", text }],
       finishReason: STOP_FINISH,
       usage: convertUsage(result.usage),
-      warnings: withSchemaWarnings(call.warnings, result.schemaWarnings),
+      warnings: withNativeWarnings(call.warnings, result.warnings),
     };
   }
 
@@ -586,7 +584,7 @@ export class AppleIntelligenceChatLanguageModel implements LanguageModelV4 {
         content: toolCallContent,
         finishReason: TOOL_CALLS_FINISH,
         usage: convertUsage(result.usage),
-        warnings: withSchemaWarnings(call.warnings, result.schemaWarnings),
+        warnings: withNativeWarnings(call.warnings, result.warnings),
       };
     }
 
@@ -594,7 +592,7 @@ export class AppleIntelligenceChatLanguageModel implements LanguageModelV4 {
       content: [{ type: "text", text: result.text ?? "" }],
       finishReason: STOP_FINISH,
       usage: convertUsage(result.usage),
-      warnings: withSchemaWarnings(call.warnings, result.schemaWarnings),
+      warnings: withNativeWarnings(call.warnings, result.warnings),
     };
   }
 

@@ -115,6 +115,13 @@ private enum ModelKind {
     static func parse(_ raw: String?) -> ModelKind {
         raw == "private-cloud" ? .privateCloud : .onDevice
     }
+
+    var displayName: String {
+        switch self {
+        case .onDevice: return "on-device"
+        case .privateCloud: return "Private Cloud Compute"
+        }
+    }
 }
 
 /// Token usage for one generation. Plain `Int`s (no `@available`) so it threads through the
@@ -778,7 +785,12 @@ private struct ConversationContext {
     let transcriptEntries: [Transcript.Entry]
     let options: GenerationOptions
     let modelKind: ModelKind
+    /// The reasoning level to apply — `nil` when none was requested, or when the serving model
+    /// cannot reason (see `warnings`).
     let reasoningLevel: String?
+    /// Settings the request asked for that this model or OS cannot apply. They are left out of the
+    /// generation and reported to the host as warnings, never dropped in silence.
+    let warnings: [String]
     /// Images attached to the current user turn (multimodal input, macOS 27+).
     let images: [DecodedImage]
     /// The request's system prompt (all `system` messages, joined). Every mode injects it as the
@@ -851,11 +863,22 @@ private func assertModelAvailability(_ modelKind: ModelKind) throws {
     }
 }
 
+/// Whether the model serving `modelKind` can reason. The on-device model cannot: a request that
+/// sets a reasoning level on it fails outright ("The selected model does not support reasoning").
+@available(macOS 27.0, *)
+private func supportsReasoning(_ modelKind: ModelKind) -> Bool {
+    switch modelKind {
+    case .onDevice: return makeOnDeviceModel().capabilities.contains(.reasoning)
+    case .privateCloud: return PrivateCloudComputeLanguageModel().capabilities.contains(.reasoning)
+    }
+}
+
 private func prepareConversationContext(
     messagesJsonString: String,
     optionsJsonString: String?,
     modelKind: ModelKind,
-    reasoningLevel: String?
+    reasoningLevel: String?,
+    hasTools: Bool
 ) throws -> ConversationContext {
     if DEBUG_LOGS {
         print("\n=== DEBUG: PARSING MESSAGES ===")
@@ -929,12 +952,40 @@ private func prepareConversationContext(
     }
     let options = makeGenerationOptions(optionsInput)
 
+    // Settings the serving model or OS cannot apply are dropped with a warning. Passing a
+    // reasoning level to a model that cannot reason fails the whole request, and on macOS 26 both
+    // reasoning and a forced tool choice were ignored without a word.
+    var warnings: [String] = []
+    var effectiveReasoningLevel: String? = nil
+    if let level = reasoningLevel, !["", "none", "off"].contains(level.lowercased()) {
+        if #available(macOS 27.0, *) {
+            if supportsReasoning(modelKind) {
+                effectiveReasoningLevel = level
+            } else {
+                warnings.append(
+                    "reasoningLevel \"\(level)\" was ignored: the \(modelKind.displayName) model "
+                        + "does not support reasoning.")
+            }
+        } else {
+            warnings.append(
+                "reasoningLevel \"\(level)\" was ignored: reasoning requires macOS 27 or later.")
+        }
+    }
+    if #unavailable(macOS 27.0), hasTools,
+        let toolChoice = optionsInput?.toolChoice, toolChoice == "required" || toolChoice == "none"
+    {
+        warnings.append(
+            "toolChoice \"\(toolChoice)\" was ignored: enforcing a tool choice requires macOS 27 "
+                + "or later, so the model decides whether to call a tool.")
+    }
+
     return ConversationContext(
         currentPrompt: currentPrompt,
         transcriptEntries: transcriptEntries,
         options: options,
         modelKind: modelKind,
-        reasoningLevel: reasoningLevel,
+        reasoningLevel: effectiveReasoningLevel,
+        warnings: warnings,
         images: currentImages,
         systemContent: systemContent
     )
@@ -1338,8 +1389,9 @@ private func createToolOutputEntry(from message: ChatMessage) -> [Transcript.Ent
 //                       tokenCount?}. Terminal: nothing follows it.
 //   0x03  reasoning   — the remainder is a reasoning/chain-of-thought text delta (reserved)
 //   0x04  usage       — the remainder is a JSON usage object, sent once before end-of-stream
-//   0x05  warning     — the remainder is a plain-text warning (e.g. a property dropped from a
-//                       tool's guide), sent before the first answer token
+//   0x05  warning     — the remainder is a plain-text warning (a setting the model cannot apply,
+//                       or a property dropped from a tool's guide), sent before the first answer
+//                       token
 //   0x06  tool calls  — the remainder is a JSON array of the round's tool calls, in the same
 //                       shape as the non-streaming result's `toolCalls`, sent before end-of-stream
 // A nil chunk is the clean end-of-stream. Every stream ends with exactly one nil or error chunk.
@@ -1381,8 +1433,9 @@ private struct ChunkSink: @unchecked Sendable {
         callback(context, nil)
     }
 
-    /// A non-fatal warning; generation continues. Used for the properties a tool's schema declares
-    /// but the guide had to drop, which the host turns into an AI SDK call warning.
+    /// A non-fatal warning; generation continues. Used for settings the model cannot apply and for
+    /// the properties a tool's schema declares but the guide had to drop; the host turns each into
+    /// an AI SDK call warning.
     func warn(_ message: String) {
         send(String(WARNING_SENTINEL) + message)
     }
@@ -2369,7 +2422,8 @@ public func appleAIGenerateUnified(
                     messagesJsonString: messagesJsonString,
                     optionsJsonString: optionsJsonString,
                     modelKind: modelKind,
-                    reasoningLevel: reasoningLevelString
+                    reasoningLevel: reasoningLevelString,
+                    hasTools: toolsJsonString?.isEmpty == false
                 )
 
                 // Determine operation mode based on provided parameters
@@ -2407,7 +2461,8 @@ public func appleAIGenerateUnified(
                 messagesJsonString: messagesJsonString,
                 optionsJsonString: optionsJsonString,
                 modelKind: modelKind,
-                reasoningLevel: reasoningLevelString
+                reasoningLevel: reasoningLevelString,
+                hasTools: toolsJsonString?.isEmpty == false
             )
 
             try Task.checkCancellation()
@@ -2600,6 +2655,7 @@ private func handleBasicMode(context: ConversationContext) async throws -> Strin
     // Return as JSON for consistency
     var json: [String: Any] = ["text": text]
     if let usage { json["usage"] = usage.jsonObject }
+    if !context.warnings.isEmpty { json["warnings"] = context.warnings }
     let jsonData = try JSONSerialization.data(withJSONObject: json, options: [])
     return String(data: jsonData, encoding: .utf8) ?? "Error: Encoding failure"
 }
@@ -2613,6 +2669,9 @@ private func handleBasicModeStream(
     debugPrintTranscript(transcript, prompt: context.currentPrompt)
     let session = try makeSession(modelKind: context.modelKind, tools: [], transcript: transcript)
 
+    for warning in context.warnings {
+        sink.warn(warning)
+    }
     var prev = ""
     for try await cumulative in makeTextStream(session: session, context: context) {
         // Observe cancellation between chunks even if the framework's sequence is slow to.
@@ -2676,7 +2735,8 @@ private func handleStructuredMode(
     // The properties the guide had to drop. They ride back with the successful result — the host
     // surfaces them as call warnings, so a caller learns a field will never be filled without
     // having to read the schema converter's source.
-    if !schemaWarnings.isEmpty { json["schemaWarnings"] = schemaWarnings }
+    let warnings = context.warnings + schemaWarnings
+    if !warnings.isEmpty { json["warnings"] = warnings }
     if #available(macOS 27.0, *) { json["usage"] = readUsage(from: session).jsonObject }
 
     let jsonData = try JSONSerialization.data(withJSONObject: json, options: [])
@@ -2747,7 +2807,8 @@ private func handleToolsMode(
 
         var json: [String: Any] = [:]
         if #available(macOS 27.0, *) { json["usage"] = readUsage(from: session).jsonObject }
-        if !schemaWarnings.isEmpty { json["schemaWarnings"] = schemaWarnings }
+        let warnings = context.warnings + schemaWarnings
+        if !warnings.isEmpty { json["warnings"] = warnings }
         if toolCalls.isEmpty {
             json["text"] = text
         } else {
@@ -2761,7 +2822,7 @@ private func handleToolsMode(
 
     // Sent before the first answer token so the host can attach them to the stream's
     // `stream-start` warnings, which is the only place the AI SDK protocol carries warnings.
-    for warning in schemaWarnings {
+    for warning in context.warnings + schemaWarnings {
         sink.warn(warning)
     }
 

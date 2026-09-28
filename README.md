@@ -118,7 +118,8 @@ transport talks to this plugin, and a custom transport (e.g. a future Node bridg
 - **Portable reasoning** — the AI SDK's top-level `reasoning` option maps onto Apple's reasoning
   levels (`minimal`/`low` → light, `medium` → moderate, `high`/`xhigh` → deep); a
   `providerOptions["apple-intelligence"].reasoningLevel` override or the model settings'
-  `reasoningLevel` are also honored
+  `reasoningLevel` are also honored. Only Private Cloud Compute can reason: on the on-device model
+  (and on macOS 26) the level is dropped and reported as a warning
 - **Per-call sampling** — `temperature` (including `0`), `topP`, `topK`, and `seed` map onto
   `GenerationOptions` sampling modes; `toolChoice` maps onto the framework's tool-calling mode
 - **Typed errors** — generation failures carry a stable `code`
@@ -379,9 +380,9 @@ uses for unsupported settings:
 
 - **AI SDK** — an entry in `result.warnings` (and in `stream-start`'s warnings for `streamText`),
   which the SDK also logs as `AI SDK Warning (apple-intelligence / …): Property "…" was omitted …`.
-- **Raw transport** — `schemaWarnings?: string[]` on the generate result, and a
+- **Raw transport** — `warnings?: string[]` on the generate result, and a
   `{ type: "warning", message }` stream event ahead of the first token.
-- **Rust** — `AppleAIGenerateResult::schema_warnings` and `AppleAIStreamEvent::Warning`.
+- **Rust** — `AppleAIGenerateResult::warnings` and `AppleAIStreamEvent::Warning`.
 
 ```ts
 // updates.frontmatter / updates.metadata are z.record(...).optional():

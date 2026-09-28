@@ -1131,9 +1131,7 @@ fn optional_unexpressible_properties_are_omitted_and_reported() {
         );
     }
 
-    let warnings = result
-        .schema_warnings
-        .expect("the omissions must be reported");
+    let warnings = result.warnings.expect("the omissions must be reported");
     let report = warnings.join("\n");
     eprintln!("optional-omission warnings:\n{report}");
     for dropped in ["frontmatter", "metadata"] {
@@ -1176,9 +1174,7 @@ fn tool_schemas_keep_working_when_an_optional_property_is_unexpressible() {
         result.text, result.tool_calls
     );
 
-    let warnings = result
-        .schema_warnings
-        .expect("the omissions must be reported");
+    let warnings = result.warnings.expect("the omissions must be reported");
     let report = warnings.join("\n");
     eprintln!("tool-omission warnings:\n{report}");
     assert!(
@@ -1305,9 +1301,7 @@ fn every_unexpressible_shape_is_droppable_when_optional() {
         "the expressible property must still be generated: {object}"
     );
 
-    let warnings = result
-        .schema_warnings
-        .expect("the omissions must be reported");
+    let warnings = result.warnings.expect("the omissions must be reported");
     let report = warnings.join("\n");
     eprintln!("droppable-shapes warnings:\n{report}");
     for dropped in [
@@ -1573,5 +1567,34 @@ fn tool_calls_end_the_generation_at_the_first_round() {
             r#"get_weather({"city":"Paris"})"#
         ],
         "every call of a parallel round must be collected"
+    );
+}
+
+/// A reasoning level on a model that cannot reason is dropped with a warning, not fatal. The
+/// on-device model has no reasoning capability, and passing it a level failed the whole request
+/// ("The selected model does not support reasoning") — so the AI SDK's portable `reasoning` option
+/// broke every on-device call that set it.
+#[test]
+#[ignore = "requires the on-device Apple Intelligence model — run locally with --ignored"]
+fn reasoning_on_a_model_that_cannot_reason_warns_instead_of_failing() {
+    let app = mock_app();
+    if !model_ready(app.handle()) {
+        return;
+    }
+
+    let mut request = user_request("Reply with exactly: ok", serde_json::json!({}));
+    request.schema = None;
+    request.reasoning_level = Some("deep".to_string());
+    let Some(result) = generate_or_skip(&app, request) else {
+        return;
+    };
+    eprintln!("reasoning probe: {:?} {:?}", result.text, result.warnings);
+    assert!(!result.text.is_empty(), "the generation must still answer");
+    let warnings = result.warnings.expect("the dropped level must be reported");
+    assert!(
+        warnings
+            .iter()
+            .any(|warning| warning.contains("reasoningLevel") && warning.contains("deep")),
+        "the warning must name the dropped setting: {warnings:?}"
     );
 }

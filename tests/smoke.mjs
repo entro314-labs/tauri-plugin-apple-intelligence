@@ -321,7 +321,7 @@ function makeTransport(overrides = {}) {
   const generateWithWarnings = transport.generate;
   transport.generate = async (options) => ({
     ...(await generateWithWarnings(options)),
-    schemaWarnings: [omission],
+    warnings: [omission],
   });
   transport.stream = async function* () {
     // The native side reports dropped properties before the first token, so the provider can put
