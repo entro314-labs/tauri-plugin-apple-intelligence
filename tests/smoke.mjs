@@ -423,4 +423,58 @@ function makeTransport(overrides = {}) {
   console.log("13 abandoned Tauri streams are cancelled, completed ones are not OK");
 }
 
+// 14. Image bytes reach the transport as base64 (a 5 KB buffer crosses provider-utils' chunked
+// encoder's 4096-byte boundary), `file://` URLs pass through untouched, and a guardrail finish
+// still reports the nested all-undefined usage shape.
+{
+  const provider = createAppleIntelligenceProvider({ transport: makeTransport() });
+  const bytes = new Uint8Array(5000).map((_, i) => (i * 31) % 256);
+  await generateText({
+    model: provider("apple-on-device"),
+    messages: [
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "Describe these." },
+          { type: "file", mediaType: "image/png", data: bytes },
+          { type: "file", mediaType: "image/png", data: new URL("file:///tmp/photo.png") },
+        ],
+      },
+    ],
+  });
+  const [inline, linked] = calls.generate.at(-1).messages[0].images;
+  assert.equal(inline.base64, Buffer.from(bytes).toString("base64"));
+  assert.equal(linked.fileURL, "file:///tmp/photo.png");
+
+  // A part the model cannot take is reported, not just replaced by a placeholder.
+  const withPdf = await generateText({
+    model: provider("apple-on-device"),
+    messages: [
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "Summarize." },
+          { type: "file", mediaType: "application/pdf", data: new Uint8Array([37, 80, 68, 70]) },
+        ],
+      },
+    ],
+  });
+  assert.ok(
+    JSON.stringify(withPdf.warnings).includes("application/pdf"),
+    `an unsupported file part must warn, got ${JSON.stringify(withPdf.warnings)}`
+  );
+
+  const filtered = await generateText({
+    model: createAppleIntelligenceProvider({
+      transport: makeTransport({
+        generateError: new AppleIntelligenceGenerationError({ code: "refusal", message: "no" }),
+      }),
+    })("apple-on-device"),
+    prompt: "hi",
+  });
+  assert.equal(filtered.usage.inputTokens, undefined);
+  assert.equal(filtered.usage.outputTokens, undefined);
+  console.log("14 image bytes → base64, file URLs pass through, null usage shape OK");
+}
+
 console.log("\nAll smoke tests passed.");

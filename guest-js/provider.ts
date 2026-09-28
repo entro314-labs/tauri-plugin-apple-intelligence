@@ -9,9 +9,14 @@ import type {
   LanguageModelV4StreamResult,
   LanguageModelV4ToolResultOutput,
   LanguageModelV4Usage,
+  SharedV4FileData,
   SharedV4Warning,
 } from "@ai-sdk/provider";
-import { generateId } from "@ai-sdk/provider-utils";
+import {
+  convertUint8ArrayToBase64,
+  createNullLanguageModelUsage,
+  generateId,
+} from "@ai-sdk/provider-utils";
 import type { JSONSchema7 } from "json-schema";
 import type {
   AppleIntelligenceImage,
@@ -61,37 +66,14 @@ export type AppleIntelligenceProviderSettings = {
 const RECOMMENDED_MAX_TOOLS = 5;
 
 /**
- * Build an empty {@link LanguageModelV4Usage}.
- *
- * macOS 26 does not report token counts, so every field is `undefined`. The shape MUST be the
- * nested usage (`inputTokens.total`, `outputTokens.total`) — the AI SDK's `asLanguageModelUsage`
- * reads `usage.inputTokens.total`, so emitting a flat shape throws. A fresh object is returned
- * per call so a consumer can never mutate shared state.
- */
-function createEmptyUsage(): LanguageModelV4Usage {
-  return {
-    inputTokens: {
-      total: undefined,
-      noCache: undefined,
-      cacheRead: undefined,
-      cacheWrite: undefined,
-    },
-    outputTokens: {
-      total: undefined,
-      text: undefined,
-      reasoning: undefined,
-    },
-  };
-}
-
-/**
  * Map the native Apple Intelligence usage (macOS 27+ reports real token counts) onto the nested
  * {@link LanguageModelV4Usage} shape. Falls back to the all-`undefined` usage when the host reports
- * none (macOS 26, which does not surface per-call token counts).
+ * none (macOS 26, which does not surface per-call token counts). The shape must be the nested one
+ * (`inputTokens.total`, …): the AI SDK's `asLanguageModelUsage` reads it, so a flat shape throws.
  */
 function convertUsage(usage?: AppleIntelligenceUsage): LanguageModelV4Usage {
   if (!usage) {
-    return createEmptyUsage();
+    return createNullLanguageModelUsage();
   }
   const noCache = Math.max(0, usage.inputTokens - usage.cachedInputTokens);
   const text = Math.max(0, usage.outputTokens - usage.reasoningTokens);
@@ -193,47 +175,40 @@ function resolveReasoningLevel(
   }
 }
 
-function uint8ToBase64(bytes: Uint8Array): string {
-  let binary = "";
-  for (let i = 0; i < bytes.length; i++) {
-    binary += String.fromCharCode(bytes[i]);
-  }
-  return btoa(binary);
-}
-
 /**
- * Convert an AI-SDK file part into an Apple Intelligence image attachment. Local file URLs/paths ride
- * through as `fileURL` (zero-copy); remote/`data:` URLs and raw bytes become `base64`. Returns `null`
- * for non-image parts.
+ * Convert an AI SDK file part into an Apple Intelligence image attachment, or `null` for a part the
+ * native side cannot take (not an image, or data it cannot reach). `file://` URLs ride through as
+ * `fileURL` (zero-copy — `supportedUrls` keeps the SDK from downloading them); bytes and base64
+ * become `base64`. Any other URL was already downloaded by the SDK and arrives as bytes.
+ *
+ * V4 file data is a tagged union (`{type: "data" | "url" | …}`) and `mediaType` may be just the
+ * top-level `image`. Reading `data` as raw bytes/URL/string — the pre-V4 shape — matched nothing,
+ * so every image turned into an "[unsupported content]" line and never reached the model.
  */
 function toAppleImage(
-  mediaType: string | undefined,
-  data: unknown
+  mediaType: string,
+  data: SharedV4FileData
 ): AppleIntelligenceImage | null {
-  const type = mediaType ?? "image/*";
-  if (!type.startsWith("image/") && type !== "image/*") {
+  if (mediaType !== "image" && !mediaType.startsWith("image/")) {
     return null;
   }
-  if (data instanceof URL) {
-    return { mediaType: type, fileURL: data.href };
+  switch (data.type) {
+    case "data":
+      return {
+        mediaType,
+        base64:
+          typeof data.data === "string"
+            ? data.data
+            : convertUint8ArrayToBase64(data.data),
+      };
+    case "url":
+      return data.url.protocol === "file:"
+        ? { mediaType, fileURL: data.url.href }
+        : null;
+    case "reference":
+    case "text":
+      return null;
   }
-  if (typeof data === "string") {
-    const dataUrl = /^data:[^;]+;base64,(.*)$/s.exec(data);
-    if (dataUrl) {
-      return { mediaType: type, base64: dataUrl[1] };
-    }
-    if (data.startsWith("file://") || data.startsWith("/")) {
-      return { mediaType: type, fileURL: data };
-    }
-    return { mediaType: type, base64: data };
-  }
-  if (data instanceof Uint8Array) {
-    return { mediaType: type, base64: uint8ToBase64(data) };
-  }
-  if (data instanceof ArrayBuffer) {
-    return { mediaType: type, base64: uint8ToBase64(new Uint8Array(data)) };
-  }
-  return null;
 }
 
 export interface AppleIntelligenceProvider {
@@ -510,7 +485,7 @@ export class AppleIntelligenceChatLanguageModel implements LanguageModelV4 {
     }
 
     return {
-      messages: this.convertPromptToMessages(options.prompt),
+      messages: this.convertPromptToMessages(options.prompt, warnings),
       tools,
       toolChoice,
       model: this.resolveModel(),
@@ -639,7 +614,7 @@ export class AppleIntelligenceChatLanguageModel implements LanguageModelV4 {
       return {
         content: [],
         finishReason: contentFilterFinish(error.code),
-        usage: createEmptyUsage(),
+        usage: createNullLanguageModelUsage(),
         warnings: [...warnings, { type: "other", message: error.message }],
       };
     }
@@ -670,7 +645,8 @@ export class AppleIntelligenceChatLanguageModel implements LanguageModelV4 {
   }
 
   private convertPromptToMessages(
-    prompt: LanguageModelV4CallOptions["prompt"]
+    prompt: LanguageModelV4CallOptions["prompt"],
+    warnings: SharedV4Warning[]
   ): AppleIntelligenceMessage[] {
     return prompt.map((message) => {
       switch (message.role) {
@@ -680,7 +656,7 @@ export class AppleIntelligenceChatLanguageModel implements LanguageModelV4 {
             content: message.content,
           };
         case "user":
-          return this.convertUserMessage(message);
+          return this.convertUserMessage(message, warnings);
         case "assistant":
           return this.convertAssistantMessage(message);
         case "tool":
@@ -694,8 +670,14 @@ export class AppleIntelligenceChatLanguageModel implements LanguageModelV4 {
     });
   }
 
+  /**
+   * A user turn's text plus its images. A part the model cannot take (a non-image file, or an image
+   * the native side cannot reach) is replaced by a placeholder line so the model knows something
+   * was left out, and reported as an `unsupported` warning so the caller knows too.
+   */
   private convertUserMessage(
-    message: Extract<LanguageModelV4Message, { role: "user" }>
+    message: Extract<LanguageModelV4Message, { role: "user" }>,
+    warnings: SharedV4Warning[]
   ): AppleIntelligenceMessage {
     if (!Array.isArray(message.content)) {
       return { role: "user", content: message.content };
@@ -706,15 +688,19 @@ export class AppleIntelligenceChatLanguageModel implements LanguageModelV4 {
     for (const part of message.content) {
       if (part.type === "text") {
         textParts.push(part.text);
-      } else if (part.type === "file") {
+      } else {
         const image = toAppleImage(part.mediaType, part.data);
         if (image) {
           images.push(image);
         } else {
-          textParts.push(`[unsupported content - ${part.mediaType ?? "file"}]`);
+          textParts.push(`[unsupported content - ${part.mediaType}]`);
+          warnings.push({
+            type: "unsupported",
+            feature: `file part (${part.mediaType}, ${part.data.type})`,
+            details:
+              "Apple Intelligence accepts images as bytes, base64, or file:// URLs; this part was left out of the prompt.",
+          });
         }
-      } else {
-        textParts.push("[unsupported content]");
       }
     }
 
@@ -917,7 +903,7 @@ export class AppleIntelligenceChatLanguageModel implements LanguageModelV4 {
         let hasText = false;
         let hasReasoning = false;
         let hasToolCalls = false;
-        let usage = createEmptyUsage();
+        let usage = createNullLanguageModelUsage();
 
         // `stream-start` is the only stream part that carries warnings, so it is held back until
         // the first real event: the native side reports the properties it had to drop from a tool's
