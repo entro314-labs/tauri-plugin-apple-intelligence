@@ -160,30 +160,74 @@ private func parseReasoningLevel(_ raw: String?) -> ContextOptions.ReasoningLeve
     }
 }
 
-/// A single image attached to the current user turn: a file URL (preferred — zero-copy) or inline
-/// base64 bytes. Decoded into a Foundation Models `Attachment` on macOS 27.
+/// A single image attached to a user turn: a file URL (preferred — zero-copy) or inline base64
+/// bytes. Decoded into a `DecodedImage` up front (see `decodeImages`).
 private struct ImageInput: Codable {
     let mediaType: String?
     let fileURL: String?
     let base64: String?
 }
 
+/// An image that has been checked to be readable. Every image is decoded before generation starts,
+/// so one the framework could not read is refused with `invalid-image` — an image that silently
+/// dropped out of the prompt left the model describing a picture it was never shown.
+private enum DecodedImage {
+    case url(URL)
+    case cgImage(CGImage)
+}
+
 @available(macOS 27.0, *)
-private func makeImageAttachment(_ input: ImageInput) -> Attachment<ImageAttachmentContent>? {
-    if let path = input.fileURL, !path.isEmpty {
-        let url = path.hasPrefix("file://") ? URL(string: path) : URL(fileURLWithPath: path)
-        if let url {
-            return Attachment(imageURL: url)
+extension DecodedImage {
+    /// The current turn's form: a prompt attachment for `respond`/`streamResponse`.
+    var promptAttachment: Attachment<ImageAttachmentContent> {
+        switch self {
+        case .url(let url): return Attachment(imageURL: url)
+        case .cgImage(let image): return Attachment(image)
         }
     }
-    if let base64 = input.base64,
-        let data = Data(base64Encoded: base64),
+
+    /// The history form: a transcript segment on a prior user turn's prompt.
+    var transcriptSegment: Transcript.Segment {
+        let image: Transcript.ImageAttachment
+        switch self {
+        case .url(let url): image = Transcript.ImageAttachment(imageURL: url)
+        case .cgImage(let cgImage): image = Transcript.ImageAttachment(cgImage)
+        }
+        return .attachment(Transcript.AttachmentSegment(content: .image(image)))
+    }
+}
+
+/// Decode a message's images, refusing any that cannot be read and — on macOS 26, which has no
+/// image input — refusing images altogether rather than generating as if they were not there.
+private func decodeImages(_ inputs: [ImageInput]?) throws -> [DecodedImage] {
+    guard let inputs, !inputs.isEmpty else { return [] }
+    guard #available(macOS 27.0, *) else {
+        throw ConversationError.unsupportedImageInput
+    }
+    return try inputs.map(decodeImage)
+}
+
+private func decodeImage(_ input: ImageInput) throws -> DecodedImage {
+    if let path = input.fileURL, !path.isEmpty {
+        guard let url = path.hasPrefix("file://") ? URL(string: path) : URL(fileURLWithPath: path),
+            let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+            CGImageSourceGetType(source) != nil
+        else {
+            throw ConversationError.invalidImage(
+                "The image at '\(path)' does not exist or is not a readable image file.")
+        }
+        return .url(url)
+    }
+    guard let base64 = input.base64, !base64.isEmpty else {
+        throw ConversationError.invalidImage("An image carries neither a fileURL nor base64 bytes.")
+    }
+    guard let data = Data(base64Encoded: base64),
         let source = CGImageSourceCreateWithData(data as CFData, nil),
         let cgImage = CGImageSourceCreateImageAtIndex(source, 0, nil)
-    {
-        return Attachment(cgImage)
+    else {
+        throw ConversationError.invalidImage("An image's base64 bytes do not decode to an image.")
     }
-    return nil
+    return .cgImage(cgImage)
 }
 
 // MARK: - Private Cloud Compute entitlement gate
@@ -671,6 +715,11 @@ private func mapConversationError(_ error: ConversationError) -> BridgeError {
         return BridgeError(code: "invalid-json", message: reason)
     case .unsupportedSchema(let reason):
         return BridgeError(code: "unsupported-guide", message: reason)
+    case .invalidImage(let reason):
+        return BridgeError(code: "invalid-image", message: reason)
+    case .unsupportedImageInput:
+        return BridgeError(
+            code: "unsupported-capability", message: "Image input requires macOS 27 or later.")
     case .noMessages:
         return BridgeError(code: "no-messages", message: "No messages provided")
     }
@@ -731,7 +780,7 @@ private struct ConversationContext {
     let modelKind: ModelKind
     let reasoningLevel: String?
     /// Images attached to the current user turn (multimodal input, macOS 27+).
-    let images: [ImageInput]
+    let images: [DecodedImage]
     /// The request's system prompt (all `system` messages, joined). Every mode injects it as the
     /// transcript's leading `Transcript.Instructions` entry — tools mode additionally carries the
     /// tool definitions on that same entry.
@@ -746,6 +795,10 @@ private enum ConversationError: Error {
     /// A JSON Schema whose shape Apple's guided generation cannot express. Refused up front so the
     /// caller can fall back, instead of being answered with a confidently wrong object.
     case unsupportedSchema(String)
+    /// An attached image that cannot be read. Refused rather than dropped from the prompt.
+    case invalidImage(String)
+    /// Images attached on an OS without image input (macOS 26).
+    case unsupportedImageInput
     case noMessages
 }
 
@@ -842,8 +895,9 @@ private func prepareConversationContext(
     let lastMessage = messages.last!
     let lastIsUserPrompt = lastMessage.role.lowercased() == "user"
     let currentPrompt: String = lastIsUserPrompt ? (lastMessage.content ?? "") : ""
-    // Images ride on the current user turn only; prior-turn images aren't replayed as history.
-    let currentImages: [ImageInput] = lastIsUserPrompt ? (lastMessage.images ?? []) : []
+    // The current turn's images ride on the prompt; prior turns' images are replayed as transcript
+    // attachments (see `createPrompt`), so a tool loop's second round still sees them.
+    let currentImages = try decodeImages(lastIsUserPrompt ? lastMessage.images : nil)
 
     // Build transcript entries from the PRIOR turns only. The latest user message is answered via
     // `session.respond(to: currentPrompt)`, so it must NOT also appear as a trailing `.prompt` entry
@@ -852,7 +906,7 @@ private func prepareConversationContext(
     // "ignores every other message, only answers the 2nd" bug. Feed prior turns as history and let
     // `respond(to:)` own the current turn.
     let historyMessages = lastIsUserPrompt ? Array(messages.dropLast()) : messages
-    let transcriptEntries = convertMessagesToTranscript(historyMessages)
+    let transcriptEntries = try convertMessagesToTranscript(historyMessages)
 
     // System messages are filtered out of the transcript entries above; gather them here so every
     // mode (basic, structured, tools) reinstates them as the leading Instructions entry. Dropping
@@ -970,7 +1024,7 @@ private struct ChatMessage: Codable {
     }
 }
 
-private func convertMessagesToTranscript(_ messages: [ChatMessage]) -> [Transcript.Entry] {
+private func convertMessagesToTranscript(_ messages: [ChatMessage]) throws -> [Transcript.Entry] {
     var entries: [Transcript.Entry] = []
 
     // Skip system messages - they will be handled separately with tools
@@ -1006,7 +1060,7 @@ private func convertMessagesToTranscript(_ messages: [ChatMessage]) -> [Transcri
     for message in nonSystemMessages {
         switch message.role.lowercased() {
         case "user":
-            entries.append(.prompt(createPrompt(from: message)))
+            entries.append(.prompt(try createPrompt(from: message)))
             if DEBUG_LOGS {
                 print("  Added PROMPT from user message")
             }
@@ -1071,7 +1125,7 @@ private func convertMessagesToTranscript(_ messages: [ChatMessage]) -> [Transcri
             continue
 
         default:
-            entries.append(.prompt(createPrompt(from: message)))  // Fallback to user prompt
+            entries.append(.prompt(try createPrompt(from: message)))  // Fallback to user prompt
         }
     }
 
@@ -1119,9 +1173,15 @@ private func convertMessagesToTranscript(_ messages: [ChatMessage]) -> [Transcri
     return entries
 }
 
-private func createPrompt(from message: ChatMessage) -> Transcript.Prompt {
-    let textSegment = Transcript.TextSegment(content: message.content ?? "")
-    return Transcript.Prompt(segments: [.text(textSegment)])
+private func createPrompt(from message: ChatMessage) throws -> Transcript.Prompt {
+    var segments: [Transcript.Segment] = [
+        .text(Transcript.TextSegment(content: message.content ?? ""))
+    ]
+    let images = try decodeImages(message.images)
+    if #available(macOS 27.0, *) {
+        segments += images.map(\.transcriptSegment)
+    }
+    return Transcript.Prompt(segments: segments)
 }
 
 private func createAssistantEntries(from message: ChatMessage) -> [Transcript.Entry] {
@@ -2555,7 +2615,7 @@ private func respondText(
 ) async throws -> (text: String, usage: UsageInfo?) {
     if #available(macOS 27.0, *) {
         let reasoning = parseReasoningLevel(context.reasoningLevel)
-        let attachments = context.images.compactMap { makeImageAttachment($0) }
+        let attachments = context.images.map(\.promptAttachment)
         if reasoning != nil || !attachments.isEmpty {
             let contextOptions = ContextOptions(reasoningLevel: reasoning)
             let response = try await session.respond(
@@ -2575,6 +2635,37 @@ private func respondText(
     return (response.content, nil)
 }
 
+/// Guided generation for the current turn, mirroring `respondText`'s overload selection: the plain
+/// schema overload carries neither a reasoning level nor image attachments, so using it for every
+/// request dropped both — the model answered about an image it was never shown.
+@available(macOS 26.0, *)
+private func respondStructured(
+    session: LanguageModelSession,
+    context: ConversationContext,
+    schema: GenerationSchema,
+    options: GenerationOptions
+) async throws -> GeneratedContent {
+    if #available(macOS 27.0, *) {
+        let reasoning = parseReasoningLevel(context.reasoningLevel)
+        let attachments = context.images.map(\.promptAttachment)
+        if reasoning != nil || !attachments.isEmpty {
+            let contextOptions = ContextOptions(
+                includeSchemaInPrompt: true, reasoningLevel: reasoning)
+            return try await session.respond(
+                schema: schema,
+                options: options,
+                contextOptions: contextOptions
+            ) {
+                context.currentPrompt
+                for attachment in attachments { attachment }
+            }.content
+        }
+    }
+    return try await session.respond(
+        to: context.currentPrompt, schema: schema, includeSchemaInPrompt: true, options: options
+    ).content
+}
+
 /// Build the streaming response for the current turn, mirroring `respondText`'s overload selection.
 @available(macOS 26.0, *)
 private func makeTextStream(
@@ -2583,7 +2674,7 @@ private func makeTextStream(
 ) -> LanguageModelSession.ResponseStream<String> {
     if #available(macOS 27.0, *) {
         let reasoning = parseReasoningLevel(context.reasoningLevel)
-        let attachments = context.images.compactMap { makeImageAttachment($0) }
+        let attachments = context.images.map(\.promptAttachment)
         if reasoning != nil || !attachments.isEmpty {
             let contextOptions = ContextOptions(reasoningLevel: reasoning)
             return session.streamResponse(
@@ -2692,15 +2783,8 @@ private func handleStructuredMode(
         options.maximumResponseTokens = STRUCTURED_DEFAULT_MAX_TOKENS
     }
 
-    // Generate structured response
-    let response = try await session.respond(
-        to: context.currentPrompt,
-        schema: generationSchema,
-        includeSchemaInPrompt: true,
-        options: options
-    )
-
-    let generatedContent = response.content
+    let generatedContent = try await respondStructured(
+        session: session, context: context, schema: generationSchema, options: options)
     let objectJson = generatedContentToJSON(generatedContent)
     let textRepresentation = String(describing: generatedContent)
 

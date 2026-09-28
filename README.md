@@ -124,7 +124,9 @@ transport talks to this plugin, and a custom transport (e.g. a future Node bridg
   `contextSize` and the offending `tokenCount` so you can condense the conversation and retry
   (Apple's documented recovery strategy)
 - **Multimodal image input** — image file parts on a user message are forwarded to the on-device
-  model as attachments; `file://` image URLs pass through zero-copy (macOS 27)
+  model as attachments, in every mode and on earlier turns of the conversation too; `file://` image
+  URLs pass through zero-copy (macOS 27). An image that cannot be read fails with `invalid-image`,
+  and images on macOS 26 fail with `unsupported-capability`, rather than being left out of the prompt
 - **Real token usage** — `usage` is reported on generate/stream results (macOS 27), including
   reasoning tokens
 - **Runtime capability queries** on the transport — `checkPrivateCloudAvailability()`,

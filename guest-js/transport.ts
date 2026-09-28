@@ -42,6 +42,8 @@ export type AppleIntelligenceErrorCode =
   | "timeout"
   | "tool-call-error"
   | "unavailable"
+  /** An attached image could not be read (undecodable bytes, or a missing/unreadable file). */
+  | "invalid-image"
   | "invalid-json"
   | "no-messages"
   /** Private Cloud Compute request failed in transit — retryable (macOS 27+). */

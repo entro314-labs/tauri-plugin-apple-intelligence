@@ -7,7 +7,7 @@
 
 use tauri::{AppHandle, test::MockRuntime};
 use tauri_plugin_apple_intelligence::{
-    AppleAIError, AppleAIGenerateRequest, AppleAIGenerateResult, AppleAIMessage,
+    AppleAIError, AppleAIGenerateRequest, AppleAIGenerateResult, AppleAIImageInput, AppleAIMessage,
     AppleAIToolDefinition, AppleIntelligenceExt,
 };
 
@@ -1328,5 +1328,169 @@ fn every_unexpressible_shape_is_droppable_when_optional() {
             object.get(dropped).is_none(),
             "a dropped property cannot come back: {object}"
         );
+    }
+}
+
+/// A 64×64 solid red PNG — an image with exactly one right answer to "what color is it?".
+const RED_PNG_BASE64: &str = "iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAAeUlEQVR4nO3PQQkAMAzAwIqof2UTMxF7HINABFzm7H7dcEEDWtCAFjSgBQ1oQQNa0IAWNKAFDWhBA1rQgBY0oAUNaEEDWtCAFjSgBQ1oQQNa0IAWNKAFDWhBA1rQgBY0oAUNaEEDWtCAFjSgBQ1oQQNa0IAWNKAFj12qxUDxeFqrFAAAAABJRU5ErkJggg==";
+
+fn user_message_with_image(prompt: &str, image: AppleAIImageInput) -> AppleAIMessage {
+    AppleAIMessage {
+        role: "user".to_string(),
+        content: Some(prompt.to_string()),
+        name: None,
+        tool_call_id: None,
+        tool_calls: None,
+        images: Some(vec![image]),
+    }
+}
+
+fn red_png() -> AppleAIImageInput {
+    AppleAIImageInput {
+        media_type: Some("image/png".to_string()),
+        file_url: None,
+        base64: Some(RED_PNG_BASE64.to_string()),
+    }
+}
+
+/// Run an image request, or `None` on an OS without image input (macOS 26 refuses images with
+/// `unsupported-capability`) or when the model's assets are not resident.
+fn generate_with_image_or_skip(
+    app: &tauri::App<MockRuntime>,
+    request: AppleAIGenerateRequest,
+) -> Option<AppleAIGenerateResult> {
+    match app.apple_intelligence().generate(request) {
+        Ok(result) => Some(result),
+        Err(AppleAIError::Generation { code, message, .. })
+            if code == "unsupported-capability" || code == "assets-unavailable" =>
+        {
+            eprintln!("SKIP: {code} ({message})");
+            None
+        }
+        Err(error) => panic!("generate: {error}"),
+    }
+}
+
+/// Structured generation must see the image. It used the plain schema overload, which carries no
+/// attachments, so `generateObject` over an image answered about a picture the model never saw
+/// (a red square came back `{"color": "blue"}`).
+#[test]
+#[ignore = "requires the on-device Apple Intelligence model — run locally with --ignored"]
+fn structured_generation_sees_the_image() {
+    let app = mock_app();
+    if !model_ready(app.handle()) {
+        return;
+    }
+
+    let mut request = user_request(
+        "What is the dominant color of this image? Answer with one lowercase word.",
+        serde_json::json!({
+            "type": "object",
+            "properties": {"color": {"type": "string"}},
+            "required": ["color"],
+        }),
+    );
+    request.messages = vec![user_message_with_image(
+        "What is the dominant color of this image? Answer with one lowercase word.",
+        red_png(),
+    )];
+    let Some(result) = generate_with_image_or_skip(&app, request) else {
+        return;
+    };
+    let object = result.object.expect("structured result carries an object");
+    eprintln!("structured image probe: {object}");
+    assert!(
+        object["color"]
+            .as_str()
+            .is_some_and(|color| color.to_lowercase().contains("red")),
+        "the image never reached guided generation: {object}"
+    );
+}
+
+/// An image on an earlier user turn must stay in the transcript. Only the current turn's images
+/// were forwarded, so a follow-up question — or the second round of a tool loop, whose last message
+/// is the tool output — lost the image and the model answered from nothing.
+#[test]
+#[ignore = "requires the on-device Apple Intelligence model — run locally with --ignored"]
+fn prior_turn_images_stay_in_the_transcript() {
+    let app = mock_app();
+    if !model_ready(app.handle()) {
+        return;
+    }
+
+    let mut request = user_request("", serde_json::json!({}));
+    request.schema = None;
+    request.messages = vec![
+        user_message_with_image("Here is an image. Just reply OK.", red_png()),
+        AppleAIMessage {
+            role: "assistant".to_string(),
+            content: Some("OK.".to_string()),
+            name: None,
+            tool_call_id: None,
+            tool_calls: None,
+            images: None,
+        },
+        AppleAIMessage {
+            role: "user".to_string(),
+            content: Some(
+                "What was the dominant color of the image I sent earlier? Answer with one word."
+                    .to_string(),
+            ),
+            name: None,
+            tool_call_id: None,
+            tool_calls: None,
+            images: None,
+        },
+    ];
+    let Some(result) = generate_with_image_or_skip(&app, request) else {
+        return;
+    };
+    eprintln!("history image probe: {:?}", result.text);
+    assert!(
+        result.text.to_lowercase().contains("red"),
+        "the earlier turn's image was dropped from the transcript: {:?}",
+        result.text
+    );
+}
+
+/// An image the framework cannot read must be refused with `invalid-image`. It used to be dropped
+/// from the prompt without a word, and the model then described a picture that did not exist.
+#[test]
+#[ignore = "requires macOS with FoundationModels — run locally with --ignored"]
+fn unreadable_images_are_refused_not_dropped() {
+    let app = mock_app();
+
+    for (label, image) in [
+        (
+            "undecodable base64",
+            AppleAIImageInput {
+                media_type: Some("image/png".to_string()),
+                file_url: None,
+                base64: Some("bm90IGFuIGltYWdl".to_string()),
+            },
+        ),
+        (
+            "missing file",
+            AppleAIImageInput {
+                media_type: Some("image/png".to_string()),
+                file_url: Some("file:///nonexistent/apple-ai-probe.png".to_string()),
+                base64: None,
+            },
+        ),
+    ] {
+        let mut request = user_request("", serde_json::json!({}));
+        request.schema = None;
+        request.messages = vec![user_message_with_image("Describe this image.", image)];
+        match app.apple_intelligence().generate(request) {
+            Err(AppleAIError::Generation { code, message, .. }) => {
+                eprintln!("{label}: [{code}] {message}");
+                if code == "unsupported-capability" || code == "unavailable" {
+                    eprintln!("SKIP: no image input here");
+                    return;
+                }
+                assert_eq!(code, "invalid-image", "{label}: {message}");
+            }
+            other => panic!("{label}: an unreadable image must be refused, got {other:?}"),
+        }
     }
 }

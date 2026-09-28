@@ -6,6 +6,11 @@ together.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Images now reach the model in every mode.** Structured generation (`generateObject`/`streamObject`) sent the prompt without its images, and an image on an earlier user turn was dropped from the conversation history, including on the second round of a tool loop. In both cases the model answered about a picture it had never seen. Structured generation also now applies `reasoningLevel`, which it previously ignored.
+- **Unreadable images are refused, not dropped.** An image whose bytes don't decode, or whose `fileURL` doesn't point to a readable image, now fails with the new `invalid-image` code. Before, the image was left out of the prompt without any error, and the model described an image that didn't exist. On macOS 26, which has no image input, a request with images now fails with `unsupported-capability`. Before, the images were ignored without any error.
+
 ## [0.12.2] - 2026-09-26
 
 ### Fixed
