@@ -487,7 +487,7 @@ private func describeTranscriptEntry(_ entry: Transcript.Entry) -> String {
 
     case .toolCalls(let toolCalls):
         let callsSummary = toolCalls.map { call in
-            "\(call.toolName)(args)"
+            "\(call.toolName)(\(call.arguments.jsonString))"
         }.joined(separator: ", ")
         return "TOOL_CALLS: [\(callsSummary)]"
 
@@ -1253,22 +1253,6 @@ private func createAssistantEntries(from message: ChatMessage) -> [Transcript.En
     return entries
 }
 
-// Helper to create GeneratedContent from dictionary
-@available(macOS 26.0, *)
-private func createGeneratedContentFromDictionary(_ dict: [String: Any]) -> GeneratedContent? {
-    // For tool arguments, we'll create a simple JSON string representation
-    // This is a workaround since KeyValuePairs cannot be created dynamically
-    guard let jsonData = try? JSONSerialization.data(withJSONObject: dict, options: []),
-        let jsonString = String(data: jsonData, encoding: .utf8)
-    else {
-        return nil
-    }
-
-    // Create GeneratedContent with the JSON string
-    // This works because GeneratedContent can hold a String value
-    return GeneratedContent(jsonString)
-}
-
 private func convertOpenAIToolCalls(_ toolCalls: [[String: Any]]) -> Transcript.ToolCalls {
     let calls = toolCalls.compactMap { call -> FoundationModels.Transcript.ToolCall? in
         guard let id = call["id"] as? String,
@@ -1276,21 +1260,17 @@ private func convertOpenAIToolCalls(_ toolCalls: [[String: Any]]) -> Transcript.
             let name = function["name"] as? String
         else { return nil }
 
-        // Parse arguments
-        var arguments: [String: Any] = [:]
-        if let argsString = function["arguments"] as? String,
-            let argsData = argsString.data(using: .utf8),
-            let args = try? JSONSerialization.jsonObject(with: argsData) as? [String: Any]
-        {
-            arguments = args
-        }
-
-        // Create GeneratedContent from arguments
-        guard let content = createGeneratedContentFromDictionary(arguments) else { return nil }
-
-        // Use the unsafe tool call creation function
-        return Transcript.ToolCall(
-            id: id, toolName: name, arguments: content)
+        // Parsed into structured content. `GeneratedContent(jsonString)` — what this used to do —
+        // is a single *string* value, so the model saw every earlier call's arguments as one
+        // JSON-encoded string instead of the object it had generated. Arguments that are not a JSON
+        // object become the empty object, as before.
+        let argsString = function["arguments"] as? String ?? ""
+        let arguments =
+            (try? GeneratedContent(json: argsString)).flatMap { content in
+                if case .structure = content.kind { return content }
+                return nil
+            } ?? GeneratedContent(properties: [:])
+        return Transcript.ToolCall(id: id, toolName: name, arguments: arguments)
     }
 
     return Transcript.ToolCalls(calls)
