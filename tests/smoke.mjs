@@ -365,4 +365,62 @@ function makeTransport(overrides = {}) {
   console.log("12 dropped-property warnings reach the caller OK");
 }
 
+// 13. The Tauri transport cancels a stream its consumer abandons. Without this, a consumer that
+// stops reading (a `break`, a cancelled ReadableStream) left the generation running to completion
+// on the host's single stream slot, and the next stream was refused with `stream-busy`. A stream
+// read to its terminal event is never cancelled.
+{
+  globalThis.window ??= globalThis;
+  const { mockIPC, clearMocks } = await import("@tauri-apps/api/mocks");
+  const { createTauriAppleIntelligenceTransport } = await import("../dist-js/index.mjs");
+
+  const invoked = [];
+  let channel;
+  mockIPC((cmd, args) => {
+    invoked.push(cmd);
+    if (cmd === "plugin:apple-intelligence|stream") {
+      channel = args.onEvent;
+      return { streamId: "s1" };
+    }
+    if (cmd === "plugin:apple-intelligence|cancel_stream") {
+      assert.equal(args.streamId, "s1");
+      return true;
+    }
+  });
+  const send = (index, message) =>
+    window.__TAURI_INTERNALS__.runCallback(channel.id, { index, message });
+  const transport = createTauriAppleIntelligenceTransport();
+  const request = { messages: [{ role: "user", content: "hi" }] };
+
+  // Read one event, then walk away.
+  const abandoned = transport.stream(request)[Symbol.asyncIterator]();
+  const first = abandoned.next();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  send(0, { type: "text", text: "Hello" });
+  assert.equal((await first).value.text, "Hello");
+  await abandoned.return();
+  assert.ok(
+    invoked.includes("plugin:apple-intelligence|cancel_stream"),
+    `an abandoned stream must be cancelled, invoked: ${invoked}`
+  );
+
+  // Read to the end: no cancel.
+  invoked.length = 0;
+  const complete = (async () => {
+    const seen = [];
+    for await (const event of transport.stream(request)) seen.push(event.type);
+    return seen;
+  })();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  send(0, { type: "text", text: "Hi" });
+  send(1, { type: "done" });
+  assert.deepEqual(await complete, ["text", "done"]);
+  assert.ok(
+    !invoked.includes("plugin:apple-intelligence|cancel_stream"),
+    `a completed stream must not be cancelled, invoked: ${invoked}`
+  );
+  clearMocks();
+  console.log("13 abandoned Tauri streams are cancelled, completed ones are not OK");
+}
+
 console.log("\nAll smoke tests passed.");

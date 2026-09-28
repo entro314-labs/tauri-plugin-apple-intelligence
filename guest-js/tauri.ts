@@ -116,6 +116,12 @@ export function createTauriAppleIntelligenceTransport(): AppleIntelligenceTransp
         abortSignal?.addEventListener("abort", cancel, { once: true });
       }
 
+      // Set once the terminal event has been handed to the consumer. A consumer that stops
+      // iterating before then (a `break`, a thrown error, a cancelled ReadableStream downstream)
+      // has abandoned the stream, and the generation is cancelled — otherwise it runs to
+      // completion holding the host's single stream slot, and the next stream fails with
+      // `stream-busy`.
+      let finished = false;
       try {
         while (true) {
           const event =
@@ -124,13 +130,17 @@ export function createTauriAppleIntelligenceTransport(): AppleIntelligenceTransp
               : await new Promise<AppleIntelligenceStreamEvent>((resolve) => {
                   pendingResolve = resolve;
                 });
+          finished = event.type === "done" || event.type === "error";
           yield event;
-          if (event.type === "done" || event.type === "error") {
+          if (finished) {
             return;
           }
         }
       } finally {
         abortSignal?.removeEventListener("abort", cancel);
+        if (!finished) {
+          cancel();
+        }
       }
     },
   } satisfies AppleIntelligenceTransport;
