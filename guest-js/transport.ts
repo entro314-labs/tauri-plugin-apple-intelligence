@@ -340,6 +340,11 @@ export interface AppleIntelligenceTransport {
   generate(
     options: AppleIntelligenceGenerateOptions
   ): Promise<AppleIntelligenceGenerateResult>;
+  /**
+   * Stream a generation. Ends after exactly one terminal event (`done` or `error`). Aborting
+   * `abortSignal`, or abandoning the iterator before the terminal event, cancels the native
+   * generation.
+   */
   stream(
     options: AppleIntelligenceStreamOptions
   ): AsyncIterable<AppleIntelligenceStreamEvent>;

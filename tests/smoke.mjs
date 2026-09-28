@@ -438,11 +438,13 @@ function makeTransport(overrides = {}) {
           { type: "text", text: "Describe these." },
           { type: "file", mediaType: "image/png", data: bytes },
           { type: "file", mediaType: "image/png", data: new URL("file:///tmp/photo.png") },
+          { type: "file", mediaType: "image/png", data: "data:image/png;base64,iVBORw0KGgo=" },
         ],
       },
     ],
   });
-  const [inline, linked] = calls.generate.at(-1).messages[0].images;
+  const [inline, linked, dataUrl] = calls.generate.at(-1).messages[0].images;
+  assert.equal(dataUrl.base64, "iVBORw0KGgo=", "a data: URL must arrive as bare base64");
   assert.equal(inline.base64, Buffer.from(bytes).toString("base64"));
   assert.equal(linked.fileURL, "file:///tmp/photo.png");
 

@@ -467,7 +467,9 @@ cargo test
 # references, nullable fields (`anyOf`, array `type`, and OpenAPI `nullable` spellings), non-string
 # `enum`/`const` and numeric bounds, fixed-length tuples, the typed refusals for recursive schemas
 # and for *required* open maps / heterogeneous tuples / boolean literals, and the omit-and-warn
-# path for the same shapes on *optional* properties (object schemas and tool schemas).
+# path for the same shapes on *optional* properties (object schemas and tool schemas); image input
+# in every mode and on earlier turns, and the `invalid-image` refusal; tool calls ending the
+# generation at the first tool round.
 cargo test --test native_probes -- --ignored
 cargo test --test mock_app_stream -- --ignored
 
