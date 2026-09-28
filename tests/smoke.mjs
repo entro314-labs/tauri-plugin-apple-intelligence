@@ -480,4 +480,59 @@ function makeTransport(overrides = {}) {
   console.log("14 image bytes → base64, file URLs pass through, null usage shape OK");
 }
 
+// 15. A refused cancel is not swallowed. A capability that allows `stream` but not `cancel_stream`
+// makes every cancel fail; the consumer must see that, not believe the generation stopped.
+{
+  const { mockIPC, clearMocks } = await import("@tauri-apps/api/mocks");
+  const { createTauriAppleIntelligenceTransport } = await import("../dist-js/index.mjs");
+  let channel;
+  mockIPC((cmd, args) => {
+    if (cmd === "plugin:apple-intelligence|stream") {
+      channel = args.onEvent;
+      return { streamId: "s2" };
+    }
+    if (cmd === "plugin:apple-intelligence|cancel_stream") {
+      throw "apple-intelligence.cancel_stream not allowed";
+    }
+  });
+  const send = (index, message) =>
+    window.__TAURI_INTERNALS__.runCallback(channel.id, { index, message });
+  const transport = createTauriAppleIntelligenceTransport();
+  const request = { messages: [{ role: "user", content: "hi" }] };
+
+  // Abandoned: the refusal surfaces from return().
+  const abandoned = transport.stream(request)[Symbol.asyncIterator]();
+  const first = abandoned.next();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  send(0, { type: "text", text: "Hello" });
+  await first;
+  await assert.rejects(abandoned.return(), /cancel_stream not allowed/);
+
+  // Aborted: the refusal fails the iterator instead of leaving it waiting on a stream that runs on.
+  const controller = new AbortController();
+  const aborted = transport.stream({ ...request, abortSignal: controller.signal })[
+    Symbol.asyncIterator
+  ]();
+  const waiting = aborted.next();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  controller.abort();
+  await assert.rejects(waiting, /cancel_stream not allowed/);
+  clearMocks();
+  console.log("15 refused cancels surface to the consumer OK");
+}
+
+// 16. A non-string providerOptions reasoningLevel is rejected, not silently ignored.
+{
+  const provider = createAppleIntelligenceProvider({ transport: makeTransport() });
+  await assert.rejects(
+    generateText({
+      model: provider("apple-private-cloud"),
+      prompt: "hi",
+      providerOptions: { "apple-intelligence": { reasoningLevel: 3 } },
+    }),
+    /reasoningLevel must be a string/
+  );
+  console.log("16 invalid reasoningLevel provider option rejected OK");
+}
+
 console.log("\nAll smoke tests passed.");

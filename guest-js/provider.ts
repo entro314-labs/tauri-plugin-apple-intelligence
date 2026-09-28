@@ -1,3 +1,4 @@
+import { InvalidArgumentError } from "@ai-sdk/provider";
 import type {
   LanguageModelV4,
   LanguageModelV4CallOptions,
@@ -428,12 +429,18 @@ export class AppleIntelligenceChatLanguageModel implements LanguageModelV4 {
     }
 
     // Provider options (never merged with the portable `reasoning` option — they win outright).
+    // A non-string level is a caller bug; ignoring it would silently fall back to another level.
     const providerReasoningLevel =
-      typeof options.providerOptions?.["apple-intelligence"]?.reasoningLevel ===
-      "string"
-        ? (options.providerOptions["apple-intelligence"]
-            .reasoningLevel as string)
-        : undefined;
+      options.providerOptions?.["apple-intelligence"]?.reasoningLevel;
+    if (
+      providerReasoningLevel !== undefined &&
+      typeof providerReasoningLevel !== "string"
+    ) {
+      throw new InvalidArgumentError({
+        argument: 'providerOptions["apple-intelligence"].reasoningLevel',
+        message: `reasoningLevel must be a string (e.g. "light", "moderate", "deep"), got ${JSON.stringify(providerReasoningLevel)}.`,
+      });
+    }
     const reasoningLevel =
       providerReasoningLevel ??
       resolveReasoningLevel(

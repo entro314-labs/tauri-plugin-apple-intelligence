@@ -80,13 +80,15 @@ export function createTauriAppleIntelligenceTransport(): AppleIntelligenceTransp
       // named-event transport registered its listener only after the stream had started, so a
       // fast first event could be lost and a lost terminal event hung the iterator forever.
       const queue: AppleIntelligenceStreamEvent[] = [];
-      let pendingResolve: ((value: AppleIntelligenceStreamEvent) => void) | null =
-        null;
+      let pending: {
+        resolve: (event: AppleIntelligenceStreamEvent) => void;
+        reject: (reason: unknown) => void;
+      } | null = null;
       const channel = new Channel<AppleIntelligenceStreamEvent>();
       channel.onmessage = (event) => {
-        if (pendingResolve) {
-          pendingResolve(event);
-          pendingResolve = null;
+        if (pending) {
+          pending.resolve(event);
+          pending = null;
         } else {
           queue.push(event);
         }
@@ -104,16 +106,29 @@ export function createTauriAppleIntelligenceTransport(): AppleIntelligenceTransp
         throw toAppleIntelligenceError(reason);
       }
 
+      const cancel = () =>
+        invoke<boolean>(command("cancel_stream"), { streamId: start.streamId });
+
       // Abort → host-side cancel. The cancelled stream still terminates through its normal
       // `done` event (emitted by the native cancellation handler), which ends this iterator;
-      // a stale abort after completion is a no-op on the host.
-      const cancel = () => {
-        void invoke(command("cancel_stream"), { streamId: start.streamId });
+      // a stale abort after completion is a no-op on the host. If the cancel itself is refused
+      // (e.g. a capability that allows `stream` but not `cancel_stream`), the iterator fails
+      // with that error rather than running on as if the abort had worked.
+      // Written from the abort handler; `as` keeps the loop's reads from being narrowed to `null`.
+      let cancelFailure = null as { reason: unknown } | null;
+      const abort = () => {
+        cancel().catch((reason: unknown) => {
+          cancelFailure = { reason };
+          if (pending) {
+            pending.reject(reason);
+            pending = null;
+          }
+        });
       };
       if (abortSignal?.aborted) {
-        cancel();
+        abort();
       } else {
-        abortSignal?.addEventListener("abort", cancel, { once: true });
+        abortSignal?.addEventListener("abort", abort, { once: true });
       }
 
       // Set once the terminal event has been handed to the consumer. A consumer that stops
@@ -123,11 +138,16 @@ export function createTauriAppleIntelligenceTransport(): AppleIntelligenceTransp
       let finished = false;
       try {
         while (true) {
+          if (cancelFailure) {
+            throw toAppleIntelligenceError(cancelFailure.reason);
+          }
           const event =
             queue.length > 0
               ? queue.shift()!
-              : await new Promise<AppleIntelligenceStreamEvent>((resolve) => {
-                  pendingResolve = resolve;
+              : await new Promise<AppleIntelligenceStreamEvent>((resolve, reject) => {
+                  pending = { resolve, reject };
+                }).catch((reason: unknown) => {
+                  throw toAppleIntelligenceError(reason);
                 });
           finished = event.type === "done" || event.type === "error";
           yield event;
@@ -136,9 +156,12 @@ export function createTauriAppleIntelligenceTransport(): AppleIntelligenceTransp
           }
         }
       } finally {
-        abortSignal?.removeEventListener("abort", cancel);
-        if (!finished) {
-          cancel();
+        abortSignal?.removeEventListener("abort", abort);
+        // Awaited, so a refused cancel surfaces to the consumer that abandoned the stream.
+        if (!finished && !cancelFailure) {
+          await cancel().catch((reason: unknown) => {
+            throw toAppleIntelligenceError(reason);
+          });
         }
       }
     },
