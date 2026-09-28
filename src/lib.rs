@@ -20,7 +20,7 @@
 //! ```
 
 use tauri::{
-    AppHandle, Manager, Runtime,
+    Manager, Runtime,
     plugin::{Builder, TauriPlugin},
 };
 
@@ -33,9 +33,9 @@ pub use error::{AppleAIError, Result};
 pub use models::*;
 
 /// Access to Apple Intelligence from Rust. Obtained via [`AppleIntelligenceExt`].
-pub struct AppleIntelligence<R: Runtime>(AppHandle<R>);
+pub struct AppleIntelligence;
 
-impl<R: Runtime> AppleIntelligence<R> {
+impl AppleIntelligence {
     /// Availability of the on-device model (device eligible + Apple Intelligence enabled + model
     /// ready).
     pub fn check_availability(&self) -> Result<AppleAIAvailability> {
@@ -54,10 +54,25 @@ impl<R: Runtime> AppleIntelligence<R> {
         native::generate(request)
     }
 
-    /// Start a streaming generation. Returns immediately with the stream id and the event name
-    /// (`apple-ai://stream/{id}`) on which [`AppleAIStreamEvent`]s are emitted via the app handle.
-    pub fn stream(&self, request: AppleAIGenerateRequest) -> Result<AppleAIStreamStart> {
-        native::stream(self.0.clone(), request)
+    /// Start a streaming generation. Returns immediately with the stream id; every
+    /// [`AppleAIStreamEvent`] is passed to `on_event`, ending with exactly one `Done` or `Error`.
+    ///
+    /// `on_event` is installed before the native task starts, so no event is lost — not even an
+    /// immediate terminal `Error`. It runs on the generation thread; hand events off (e.g. over a
+    /// channel) rather than blocking in it.
+    ///
+    /// ```rust,ignore
+    /// let (tx, rx) = std::sync::mpsc::channel();
+    /// let start = app.apple_intelligence().stream(request, move |event| {
+    ///     let _ = tx.send(event);
+    /// })?;
+    /// ```
+    pub fn stream(
+        &self,
+        request: AppleAIGenerateRequest,
+        on_event: impl Fn(AppleAIStreamEvent) + Send + Sync + 'static,
+    ) -> Result<AppleAIStreamStart> {
+        native::stream(Box::new(on_event), request)
     }
 
     /// Cancel the in-flight stream identified by `stream_id` (from [`AppleAIStreamStart`]).
@@ -104,12 +119,12 @@ impl<R: Runtime> AppleIntelligence<R> {
 /// Extension trait giving all [`Manager`] types (app handle, window, webview) access to the
 /// Apple Intelligence API.
 pub trait AppleIntelligenceExt<R: Runtime> {
-    fn apple_intelligence(&self) -> &AppleIntelligence<R>;
+    fn apple_intelligence(&self) -> &AppleIntelligence;
 }
 
 impl<R: Runtime, T: Manager<R>> AppleIntelligenceExt<R> for T {
-    fn apple_intelligence(&self) -> &AppleIntelligence<R> {
-        self.state::<AppleIntelligence<R>>().inner()
+    fn apple_intelligence(&self) -> &AppleIntelligence {
+        self.state::<AppleIntelligence>().inner()
     }
 }
 
@@ -128,7 +143,7 @@ pub fn init<R: Runtime>() -> TauriPlugin<R> {
             commands::prewarm,
         ])
         .setup(|app, _api| {
-            app.manage(AppleIntelligence(app.clone()));
+            app.manage(AppleIntelligence);
             Ok(())
         })
         .build()

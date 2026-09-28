@@ -33,14 +33,18 @@ pub(crate) async fn generate(
 
 /// Streaming events are delivered over `on_event`, an invoke [`Channel`](tauri::ipc::Channel) the
 /// guest creates *before* invoking — so no event (including an immediate terminal `error`) can be
-/// lost to a listener-registration race. The Rust-side API ([`crate::AppleIntelligence::stream`])
-/// keeps emitting app events instead.
+/// lost to a listener-registration race.
 #[command]
 pub(crate) async fn stream(
     request: AppleAIGenerateRequest,
     on_event: tauri::ipc::Channel<AppleAIStreamEvent>,
 ) -> Result<AppleAIStreamStart, AppleAIError> {
-    native::stream_to_channel(on_event, request)
+    native::stream(
+        Box::new(move |event| {
+            let _ = on_event.send(event);
+        }),
+        request,
+    )
 }
 
 #[command]

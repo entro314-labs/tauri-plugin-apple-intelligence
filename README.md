@@ -93,7 +93,10 @@ use tauri_plugin_apple_intelligence::AppleIntelligenceExt;
 let ai = app.apple_intelligence();
 let availability = ai.check_availability()?;
 let info = ai.context_info(None)?; // contextSize for "on-device"
-let start = ai.stream(request)?;   // events on start.event_name
+let (tx, rx) = std::sync::mpsc::channel();
+let start = ai.stream(request, move |event| {
+    let _ = tx.send(event); // every AppleAIStreamEvent, ending with Done or Error
+})?;
 ai.cancel_stream(&start.stream_id)?;
 ```
 

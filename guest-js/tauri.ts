@@ -13,8 +13,6 @@ import { toAppleIntelligenceError } from "./transport";
 
 type StreamStart = {
   streamId: string;
-  /** App-event name used by the Rust-side stream API; channel-backed webview streams ignore it. */
-  eventName: string;
 };
 
 /** Route an invoke to this plugin's command surface (`plugin:apple-intelligence|<command>`). */
