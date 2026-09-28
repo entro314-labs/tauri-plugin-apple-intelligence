@@ -87,8 +87,8 @@ pub struct AppleAIGenerateRequest {
     pub tool_choice: Option<String>,
 }
 
-/// Token usage for one generation. All counts are `0` on macOS 26 (which does not report per-call
-/// token usage); real counts arrive on macOS 27+.
+/// Token usage for one generation (macOS 27+). macOS 26 does not report per-call token usage, so
+/// results carry `usage: None` and streams emit no `Usage` event there.
 #[derive(Serialize, Deserialize, specta::Type, Clone, Debug, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct AppleAIUsage {

@@ -200,8 +200,8 @@ export type AppleIntelligenceContextInfo = {
 };
 
 /**
- * Token usage for one generation. All counts are `0` on macOS 26 (which does not report per-call
- * token usage); real counts arrive on macOS 27+.
+ * Token usage for one generation (macOS 27+). macOS 26 does not report per-call token usage, so
+ * results and streams there carry no `usage` at all.
  */
 export type AppleIntelligenceUsage = {
   inputTokens: number;
