@@ -195,6 +195,8 @@ present in the running process's code signature (read via the Security framework
 - `prewarm("private-cloud")` is a no-op.
 - A `model: "private-cloud"` `generate`/`stream` request is refused with the typed `unavailable`
   code **before** a session is constructed, instead of being attempted.
+- On macOS 26, where Private Cloud Compute does not exist, a `model: "private-cloud"` request is
+  refused with `unavailable` too. It is never quietly served by the on-device model.
 
 The check is deliberately conservative: anything it cannot positively confirm counts as "no
 entitlement", so the failure mode is a false negative (PCC reported unavailable to an app that

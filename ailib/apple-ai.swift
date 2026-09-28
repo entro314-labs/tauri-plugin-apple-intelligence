@@ -429,9 +429,9 @@ private func makeOnDeviceModel() -> SystemLanguageModel {
 
 /// Build a session backed by the requested model. Private Cloud Compute is used only on macOS 27+
 /// *and* only when this process holds the required entitlement — an unentitled `private-cloud`
-/// request throws rather than constructing a model that cannot serve it. On macOS 26, where PCC
-/// does not exist at all, a `private-cloud` request still falls back to the on-device model.
-/// Both models conform to `LanguageModel`, so the tools + transcript flow is identical.
+/// request throws rather than constructing a model that cannot serve it. (`assertModelAvailability`
+/// has already refused `private-cloud` on macOS 26.) Both models conform to `LanguageModel`, so the
+/// tools + transcript flow is identical.
 @available(macOS 26.0, *)
 private func makeSession(
     modelKind: ModelKind,
@@ -814,13 +814,19 @@ private enum ConversationError: Error {
     case noMessages
 }
 
-/// Refuse a request whose backing model cannot serve it. A `private-cloud` request that macOS 27
-/// with the entitlement will actually route to PCC is checked against PCC's own availability;
-/// everything else — on-device requests, and the macOS 26 fallback where `private-cloud` is
-/// served on-device — is checked against the on-device model.
+/// Refuse a request whose backing model cannot serve it. A `private-cloud` request is checked
+/// against Private Cloud Compute's own availability — and refused outright on macOS 26, where PCC
+/// does not exist. It used to be served by the on-device model there without a word: a caller
+/// that asked for the 32k-context model got the small one, while `pcc_check_availability` said
+/// PCC was unavailable and an unentitled macOS 27 process was refused. On-device requests are
+/// checked against the on-device model.
 @available(macOS 26.0, *)
 private func assertModelAvailability(_ modelKind: ModelKind) throws {
-    if case .privateCloud = modelKind, #available(macOS 27.0, *) {
+    if case .privateCloud = modelKind {
+        guard #available(macOS 27.0, *) else {
+            throw ConversationError.privateCloudUnavailable(
+                "Private Cloud Compute requires macOS 27 or later. Use `model: \"on-device\"`.")
+        }
         guard hasPrivateCloudComputeEntitlement else {
             throw ConversationError.privateCloudUnavailable(
                 PRIVATE_CLOUD_COMPUTE_ENTITLEMENT_REASON)
