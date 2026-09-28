@@ -1561,6 +1561,10 @@ private struct AnyCodable: Codable {
     import FoundationModels
 #endif
 
+/// Where the host records an object schema's declared property order (see the `object` case of
+/// `convertJSONSchemaToDynamic`).
+private let PROPERTY_ORDER_KEY = "x-apple-ai-property-order"
+
 /// Hands out a unique type name for every named schema inside one `GenerationSchema`.
 ///
 /// Names are not decoration. `GenerationSchema` keys its `$defs` by them, and a nested schema whose
@@ -2231,9 +2235,17 @@ private func convertJSONSchemaToDynamic(
         let objectName = name()
         let required = (dict["required"] as? [String]) ?? []
         var props: [DynamicGenerationSchema.Property] = []
-        // Sorted so the guide's property order — and the names allocated while converting the
-        // children — do not depend on dictionary iteration order.
-        for (propName, subSchemaAny) in (declared ?? [:]).sorted(by: { $0.key < $1.key }) {
+        // In declared order: the model fills properties in the order the guide lists them, so
+        // `{reasoning, answer}` must stay reasoning-first. JSON parsing here loses key order, so
+        // the host records it under PROPERTY_ORDER_KEY; keys it does not list (a host that sent
+        // none) follow alphabetically, which also keeps the allocated names deterministic.
+        let declaredOrder = (dict[PROPERTY_ORDER_KEY] as? [String]) ?? []
+        let rank = Dictionary(
+            declaredOrder.enumerated().map { ($1, $0) }, uniquingKeysWith: { first, _ in first })
+        let orderedProperties = (declared ?? [:]).sorted {
+            (rank[$0.key] ?? Int.max, $0.key) < (rank[$1.key] ?? Int.max, $1.key)
+        }
+        for (propName, subSchemaAny) in orderedProperties {
             let propertyPath = path.isEmpty ? propName : "\(path).\(propName)"
             // Only `required` decides presence. A `.nullable()` field stays required and carries an
             // explicit `null` in its union; marking it optional instead would let the model omit the
@@ -2717,6 +2729,9 @@ private func handleStructuredMode(
     // Build schema from JSON
     let (rootSchema, deps, schemaWarnings) = try buildSchemasFromJson(jsonObj)
     let generationSchema = try GenerationSchema(root: rootSchema, dependencies: deps)
+    if DEBUG_LOGS {
+        print("=== DEBUG: GUIDE ===\n\(generationSchema.debugDescription)\n=== END GUIDE ===")
+    }
 
     // Create session without tools (structured generation doesn't use tools constructor)
     let transcript = makeTranscript(context: context)

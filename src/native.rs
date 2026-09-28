@@ -192,12 +192,22 @@ mod macos {
                     .tools
                     .as_ref()
                     .filter(|tools| !tools.is_empty())
-                    .map(|tools| json_cstring("Tools", tools))
+                    .map(|tools| {
+                        let mut tools = tools.clone();
+                        for tool in &mut tools {
+                            annotate_property_order(&mut tool.parameters);
+                        }
+                        json_cstring("Tools", &tools)
+                    })
                     .transpose()?,
                 schema: request
                     .schema
                     .as_ref()
-                    .map(|schema| json_cstring("Schema", schema))
+                    .map(|schema| {
+                        let mut schema = schema.clone();
+                        annotate_property_order(&mut schema);
+                        json_cstring("Schema", &schema)
+                    })
                     .transpose()?,
                 model: optional_cstring(request.model.as_deref())?,
                 reasoning_level: optional_cstring(request.reasoning_level.as_deref())?,
@@ -236,6 +246,47 @@ mod macos {
                     context,
                     on_chunk,
                 )
+            }
+        }
+    }
+
+    /// The key under which the Swift bridge reads an object schema's declared property order.
+    const PROPERTY_ORDER_KEY: &str = "x-apple-ai-property-order";
+
+    /// Record every object schema's declared property order under [`PROPERTY_ORDER_KEY`].
+    ///
+    /// Guided generation fills properties in the order the schema declares them — Apple: "The
+    /// model generates Generable properties in the order they're declared" — so the order carries
+    /// meaning (`{reasoning, answer}` is not `{answer, reasoning}`). The Swift bridge parses JSON
+    /// into unordered dictionaries, so the order travels as an explicit list beside `properties`.
+    /// Walks every keyword the bridge converts through.
+    fn annotate_property_order(schema: &mut serde_json::Value) {
+        let serde_json::Value::Object(node) = schema else {
+            return;
+        };
+        if let Some(serde_json::Value::Object(properties)) = node.get("properties") {
+            let order = properties.keys().cloned().map(serde_json::Value::String);
+            node.insert(PROPERTY_ORDER_KEY.into(), order.collect());
+        }
+        for key in ["properties", "definitions", "$defs"] {
+            if let Some(serde_json::Value::Object(children)) = node.get_mut(key) {
+                children.values_mut().for_each(annotate_property_order);
+            }
+        }
+        for key in [
+            "items",
+            "prefixItems",
+            "additionalItems",
+            "anyOf",
+            "oneOf",
+            "allOf",
+        ] {
+            match node.get_mut(key) {
+                Some(serde_json::Value::Array(members)) => {
+                    members.iter_mut().for_each(annotate_property_order)
+                }
+                Some(member) => annotate_property_order(member),
+                None => {}
             }
         }
     }
@@ -535,6 +586,56 @@ mod macos {
         // the terminal chunk calls this.
         let state = unsafe { Arc::from_raw(context as *const StreamState) };
         streams().lock().unwrap().remove(&state.id);
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn order(node: &serde_json::Value) -> Vec<&str> {
+            node[PROPERTY_ORDER_KEY]
+                .as_array()
+                .unwrap_or_else(|| panic!("no property order on {node}"))
+                .iter()
+                .map(|key| key.as_str().unwrap())
+                .collect()
+        }
+
+        /// Declared order survives parsing (`preserve_order`) and is recorded on every object
+        /// schema the bridge converts: the root, nested properties, array items, tuple members,
+        /// union branches and shared definitions.
+        #[test]
+        fn property_order_is_recorded_on_every_object_schema() {
+            let mut schema: serde_json::Value = serde_json::from_str(
+                r##"{
+                    "type": "object",
+                    "properties": {
+                        "reasoning": {"type": "string"},
+                        "answer": {"type": "object", "properties": {"zulu": {}, "alpha": {}}},
+                        "list": {"type": "array", "items": {"type": "object", "properties": {"b": {}, "a": {}}}},
+                        "pair": {"type": "array", "prefixItems": [{"type": "object", "properties": {"y": {}, "x": {}}}]},
+                        "either": {"anyOf": [{"type": "object", "properties": {"n": {}, "m": {}}}, {"type": "null"}]},
+                        "ref": {"$ref": "#/$defs/Shared"}
+                    },
+                    "$defs": {"Shared": {"type": "object", "properties": {"second": {}, "first": {}}}}
+                }"##,
+            )
+            .unwrap();
+            annotate_property_order(&mut schema);
+
+            assert_eq!(
+                order(&schema),
+                ["reasoning", "answer", "list", "pair", "either", "ref"]
+            );
+            let properties = &schema["properties"];
+            assert_eq!(order(&properties["answer"]), ["zulu", "alpha"]);
+            assert_eq!(order(&properties["list"]["items"]), ["b", "a"]);
+            assert_eq!(order(&properties["pair"]["prefixItems"][0]), ["y", "x"]);
+            assert_eq!(order(&properties["either"]["anyOf"][0]), ["n", "m"]);
+            assert_eq!(order(&schema["$defs"]["Shared"]), ["second", "first"]);
+            // Nodes without `properties` are left alone.
+            assert!(properties["reasoning"].get(PROPERTY_ORDER_KEY).is_none());
+        }
     }
 }
 

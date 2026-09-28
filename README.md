@@ -244,6 +244,13 @@ Shapes the framework cannot express are never quietly coerced into something els
 one is refused with the typed `unsupported-guide` code; an **optional** one is dropped from the
 guide and reported as a warning — see [Refused vs. omitted](#refused-vs-omitted).
 
+Properties are generated in the order the schema declares them, as Apple's guided generation
+does for `@Generable` types, so put fields the model should work out first (e.g. `reasoning`)
+before the ones that depend on them (e.g. `answer`). The crate enables `serde_json`'s
+`preserve_order` feature so that order survives parsing. Because Cargo unifies features, that
+applies to every crate in your build: `serde_json::Map` keeps insertion order instead of sorting
+its keys.
+
 Structured generation defaults to a **1024 output-token cap** when no `maxTokens` is set: an
 uncapped guided generation can run away extending an unbounded string or array field until it
 overflows the context window (minutes of inference ending in `context-window-exceeded`). Pass an
