@@ -6,6 +6,8 @@ together.
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-09-28
+
 ### Added
 
 - **Streams run concurrently.** Before, only one stream could run at a time, and a second stream was refused with `stream-busy` until the first finished. Each stream now gets its own routing and can be cancelled on its own.
@@ -96,7 +98,8 @@ together.
   an explicit `maxTokens` for genuinely larger objects.
 - npm: removed the `ai` peer dependency — the provider only depends on `@ai-sdk/provider`.
 
-[Unreleased]: https://github.com/entro314-labs/tauri-plugin-apple-intelligence/compare/v0.12.2...HEAD
+[Unreleased]: https://github.com/entro314-labs/tauri-plugin-apple-intelligence/compare/v0.13.0...HEAD
+[0.13.0]: https://github.com/entro314-labs/tauri-plugin-apple-intelligence/compare/v0.12.2...v0.13.0
 [0.12.2]: https://github.com/entro314-labs/tauri-plugin-apple-intelligence/compare/v0.12.1...v0.12.2
 [0.12.1]: https://github.com/entro314-labs/tauri-plugin-apple-intelligence/compare/v0.12.0...v0.12.1
 [0.12.0]: https://github.com/entro314-labs/tauri-plugin-apple-intelligence/releases/tag/v0.12.0
