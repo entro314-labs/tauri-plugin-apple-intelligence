@@ -45,7 +45,6 @@ mod macos {
         fn apple_ai_register_tool_callback(
             cb: Option<extern "C" fn(u64, *const std::os::raw::c_char)>,
         );
-        fn apple_ai_tool_result_callback(tool_id: u64, result_json: *const std::os::raw::c_char);
 
         fn apple_ai_cancel_stream() -> bool;
 
@@ -57,7 +56,6 @@ mod macos {
             reasoning_level: *const std::os::raw::c_char,
             options_json: *const std::os::raw::c_char,
             stream: bool,
-            stop_after_tool_calls: bool,
             on_chunk: Option<extern "C" fn(*const std::os::raw::c_char)>,
         ) -> *mut std::os::raw::c_char;
     }
@@ -273,7 +271,6 @@ mod macos {
                     .map_or(std::ptr::null(), |value| value.as_ptr()),
                 c_options.as_ptr(),
                 false,
-                request.stop_after_tool_calls.unwrap_or(true),
                 None,
             )
         };
@@ -469,7 +466,6 @@ mod macos {
                     .map_or(std::ptr::null(), |value| value.as_ptr()),
                 c_options.as_ptr(),
                 true,
-                request.stop_after_tool_calls.unwrap_or(true),
                 Some(stream_chunk_callback),
             );
         });
@@ -686,9 +682,6 @@ mod macos {
         {
             state.tool_calls.push((call_id, tool_name, args));
         }
-
-        let result = CString::new("{}").unwrap();
-        unsafe { apple_ai_tool_result_callback(tool_id, result.as_ptr()) };
     }
 
     // Streaming chunk channel tags — must match the Swift bridge's sentinel table. Untagged chunks

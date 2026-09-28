@@ -41,7 +41,6 @@ fn request(prompt: &str) -> AppleAIGenerateRequest {
         top_k: None,
         seed: None,
         tool_choice: None,
-        stop_after_tool_calls: None,
     }
 }
 
@@ -89,7 +88,6 @@ fn webview_stream_command_accepts_a_channel() {
             "schema": null,
             "maxTokens": 16,
             "temperature": null,
-            "stopAfterToolCalls": null,
         },
         "onEvent": "__CHANNEL__:1",
     });

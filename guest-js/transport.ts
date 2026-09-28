@@ -240,7 +240,6 @@ export type AppleIntelligenceGenerateOptions = {
   /** Sampling seed for reproducible generations. */
   seed?: number;
   toolChoice?: AppleIntelligenceToolChoice;
-  stopAfterToolCalls?: boolean;
 };
 
 export type AppleIntelligenceGenerateResult = {
@@ -297,7 +296,6 @@ export type AppleIntelligenceStreamOptions = {
   /** Sampling seed for reproducible generations. */
   seed?: number;
   toolChoice?: AppleIntelligenceToolChoice;
-  stopAfterToolCalls?: boolean;
   /**
    * Aborting this signal cancels the in-flight on-device generation (the transport calls the
    * host's cancel API). The stream then ends with a normal `done` event. Without it, a superseded

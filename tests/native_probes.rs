@@ -69,7 +69,6 @@ fn user_request(prompt: &str, schema: serde_json::Value) -> AppleAIGenerateReque
         top_k: None,
         seed: None,
         tool_choice: None,
-        stop_after_tool_calls: None,
     }
 }
 
@@ -118,7 +117,6 @@ fn system_prompt_is_honored_without_tools() {
         top_k: None,
         seed: None,
         tool_choice: None,
-        stop_after_tool_calls: None,
     };
     let Some(result) = generate_or_skip(&app, request) else {
         return;
@@ -186,7 +184,6 @@ fn assistant_tool_call_history_survives_round_trip() {
         top_k: None,
         seed: None,
         tool_choice: None,
-        stop_after_tool_calls: None,
     };
     let Some(result) = generate_or_skip(&app, request) else {
         return;
@@ -1493,4 +1490,88 @@ fn unreadable_images_are_refused_not_dropped() {
             other => panic!("{label}: an unreadable image must be refused, got {other:?}"),
         }
     }
+}
+
+/// Two tools where the second needs the first one's output — the shape that exposes a model
+/// continuing past a tool call it has no real output for.
+fn dependent_tools() -> Vec<AppleAIToolDefinition> {
+    vec![
+        AppleAIToolDefinition {
+            name: "get_user_city".to_string(),
+            description: Some(
+                "Returns the city the user lives in. Takes no arguments.".to_string(),
+            ),
+            parameters: serde_json::json!({"type": "object", "properties": {}}),
+        },
+        AppleAIToolDefinition {
+            name: "get_weather".to_string(),
+            description: Some("Returns the current weather for a city.".to_string()),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"],
+            }),
+        },
+    ]
+}
+
+fn tool_call_names(result: &AppleAIGenerateResult) -> Vec<String> {
+    result
+        .tool_calls
+        .iter()
+        .flatten()
+        .map(|call| format!("{}({})", call.function.name, call.function.arguments))
+        .collect()
+}
+
+/// A tool call ends the generation. Tools run on the host, so the model cannot be given their
+/// output mid-generation; the bridge used to hand it a placeholder and let it continue, and asked to
+/// find the user's city and then its weather, it went on to call `get_weather("New York")` — an
+/// argument invented from an output it never saw, which the host then executed. A parallel round
+/// (two independent calls in one turn) must still come back whole.
+#[test]
+#[ignore = "requires the on-device Apple Intelligence model — run locally with --ignored"]
+fn tool_calls_end_the_generation_at_the_first_round() {
+    let app = mock_app();
+    if !model_ready(app.handle()) {
+        return;
+    }
+
+    let mut dependent = tool_request(
+        "First find out which city I live in with get_user_city, then tell me the weather there \
+         using get_weather.",
+        dependent_tools(),
+    );
+    dependent.temperature = Some(0.0);
+    let Some(result) = generate_or_skip(&app, dependent) else {
+        return;
+    };
+    let calls = tool_call_names(&result);
+    eprintln!("dependent round: {calls:?}");
+    assert_eq!(
+        calls,
+        ["get_user_city({})"],
+        "the generation must stop at the first tool round, not call get_weather with an \
+         invented city"
+    );
+
+    let mut parallel = tool_request(
+        "What's the weather in Athens and in Paris? Call get_weather once for each city.",
+        dependent_tools(),
+    );
+    parallel.temperature = Some(0.0);
+    let Some(result) = generate_or_skip(&app, parallel) else {
+        return;
+    };
+    let mut calls = tool_call_names(&result);
+    calls.sort();
+    eprintln!("parallel round: {calls:?}");
+    assert_eq!(
+        calls,
+        [
+            r#"get_weather({"city":"Athens"})"#,
+            r#"get_weather({"city":"Paris"})"#
+        ],
+        "every call of a parallel round must be collected"
+    );
 }

@@ -1442,36 +1442,44 @@ private struct JSProxyTool: Tool {
     /// This request's own collector — never shared, so a concurrent request's tool calls can
     /// never leak into this one's result.
     let collector: ToolCallCollector
-    /// This request's streaming coordinator; `nil` for non-streaming requests.
-    let coordinator: StreamingCoordinator?
 
     var parameters: GenerationSchema { parametersSchema }
 
+    /// Record the call, then end the generation. The host executes tools (the AI SDK runs them and
+    /// sends the outputs back in the next request), so there is no real output to give the model
+    /// here. Returning a placeholder let it carry on as if the tool had run: asked to look up the
+    /// user's city and then fetch that city's weather, it called `get_weather("New York")` — an
+    /// argument built on an output it never received — and the host executed that call too.
     func call(arguments: JSArguments) async throws -> String {
-        guard let cb = jsToolCallback else {
-            return "Tool system not available"
-        }
-
-        // Serialize arguments and forward to JavaScript for external execution
         let jsonObj = generatedContentToJSON(arguments.raw)
-        guard let data = try? JSONSerialization.data(withJSONObject: jsonObj),
+
+        // Streaming requests hand the call to the host as it happens.
+        if let cb = jsToolCallback,
+            let data = try? JSONSerialization.data(withJSONObject: jsonObj),
             let jsonStr = String(data: data, encoding: .utf8)
-        else {
-            return "Unable to process tool arguments"
+        {
+            jsonStr.withCString { cb(toolID, $0) }
         }
 
-        // Notify JavaScript side for collection and external execution
-        jsonStr.withCString { cb(toolID, $0) }
-
-        // Collect this tool call for post-processing
+        // Recorded before throwing, so every call of a parallel tool round is collected even
+        // though the first throw ends the round.
         collector.append(id: toolID, name: name, arguments: jsonObj as? [String: Any] ?? [:])
-
-        // Signal completion to this request's streaming coordinator for early termination
-        await coordinator?.toolCompleted()
-
-        // Return placeholder output to allow generation to continue naturally
-        return "Tool call executed"
+        throw ToolRoundComplete()
     }
+}
+
+/// Thrown by `JSProxyTool.call` to end a generation at its first tool round. The framework
+/// surfaces it wrapped in `LanguageModelSession.ToolCallError`; `handleToolsMode` recognizes it
+/// with `isToolRoundComplete` and finishes normally with the collected calls.
+private struct ToolRoundComplete: Error {}
+
+@available(macOS 26.0, *)
+private func isToolRoundComplete(_ error: Error) -> Bool {
+    if error is ToolRoundComplete { return true }
+    if let toolError = error as? LanguageModelSession.ToolCallError {
+        return toolError.underlyingError is ToolRoundComplete
+    }
+    return false
 }
 
 // MARK: - Tool Definition Structure
@@ -2394,38 +2402,6 @@ private final class ToolCallCollector: @unchecked Sendable {
     }
 }
 
-// MARK: - Streaming Coordinator for Early Termination
-
-/// Per-request early-termination signal for streaming tools mode. One instance per request —
-/// the old process-wide singleton let a concurrent request's tool completion prematurely
-/// terminate an unrelated stream.
-@available(macOS 26.0, *)
-private actor StreamingCoordinator {
-    private let shouldStopAfterTools: Bool
-    private var completedToolCount = 0
-
-    init(stopAfterToolCalls: Bool) {
-        shouldStopAfterTools = stopAfterToolCalls
-    }
-
-    func toolCompleted() {
-        completedToolCount += 1
-    }
-
-    func shouldTerminateStream() -> Bool {
-        // Stop streaming as soon as at least one tool has been invoked when requested
-        shouldStopAfterTools && completedToolCount > 0
-    }
-}
-
-// C callback that receives tool results (for compatibility with JS side)
-@_cdecl("apple_ai_tool_result_callback")
-public func appleAIToolResultCallback(_ toolID: UInt64, _ resultJson: UnsafePointer<CChar>) {
-    // In natural completion mode, we don't need to resume anything
-    // This callback exists for JS compatibility but doesn't affect Swift execution
-    _ = String(cString: resultJson)
-}
-
 // MARK: - Unified Generation Function
 
 @available(macOS 26.0, *)
@@ -2438,7 +2414,6 @@ public func appleAIGenerateUnified(
     reasoningLevel: UnsafePointer<CChar>?,  // nil | "light" | "moderate" | "deep" | custom
     optionsJson: UnsafePointer<CChar>?,  // JSON: {temperature?, topP?, topK?, seed?, maxTokens?, toolChoice?}
     stream: Bool,
-    stopAfterToolCalls: Bool,  // New parameter - controls early termination behavior
     onChunk: (@convention(c) (UnsafePointer<CChar>?) -> Void)?
 ) -> UnsafeMutablePointer<CChar>? {
     let messagesJsonString = String(cString: messagesJson)
@@ -2479,7 +2454,6 @@ public func appleAIGenerateUnified(
                         context: context,
                         toolsJsonString: toolsStr,
                         streaming: false,
-                        stopAfterToolCalls: stopAfterToolCalls,
                         onChunk: nil
                     )
                 } else if let schemaStr = schemaJsonString, !schemaStr.isEmpty {
@@ -2526,7 +2500,6 @@ public func appleAIGenerateUnified(
                         context: context,
                         toolsJsonString: toolsStr,
                         streaming: true,
-                        stopAfterToolCalls: stopAfterToolCalls,
                         onChunk: onChunk
                     )
                 } else if let schemaStr = schemaJsonString, !schemaStr.isEmpty {
@@ -2807,7 +2780,6 @@ private func handleToolsMode(
     context: ConversationContext,
     toolsJsonString: String,
     streaming: Bool,
-    stopAfterToolCalls: Bool,
     onChunk: (@convention(c) (UnsafePointer<CChar>?) -> Void)?
 ) async throws -> String {
     // Parse tools
@@ -2819,8 +2791,6 @@ private func handleToolsMode(
 
     // Per-request tool state: never shared across requests.
     let collector = ToolCallCollector()
-    let coordinator: StreamingCoordinator? =
-        streaming ? StreamingCoordinator(stopAfterToolCalls: stopAfterToolCalls) : nil
 
     // Build tools
     var tools: [any Tool] = []
@@ -2838,7 +2808,7 @@ private func handleToolsMode(
         let genSchema = try GenerationSchema(root: root, dependencies: deps)
         let proxy = JSProxyTool(
             toolID: idNum, name: name, description: description, parametersSchema: genSchema,
-            collector: collector, coordinator: coordinator
+            collector: collector
         )
         tools.append(proxy)
     }
@@ -2856,13 +2826,19 @@ private func handleToolsMode(
     let session = try makeSession(modelKind: context.modelKind, tools: tools, transcript: transcript)
 
     if !streaming {
-        // Non-streaming with tools. `respondText` honors reasoning level / image attachments and
-        // reads token usage; tool calls are gathered as a side effect via this request's collector.
-        let (text, usage) = try await respondText(session: session, context: context)
+        // Non-streaming with tools. `respondText` honors reasoning level / image attachments. A
+        // tool call ends the generation (see `JSProxyTool.call`) and comes back through this
+        // request's collector.
+        var text = ""
+        do {
+            text = try await respondText(session: session, context: context).text
+        } catch where isToolRoundComplete(error) {
+            // The model called a tool; the collected calls are the result.
+        }
         let toolCalls = collector.getAllCalls()
 
         var json: [String: Any] = [:]
-        if let usage { json["usage"] = usage.jsonObject }
+        if #available(macOS 27.0, *) { json["usage"] = readUsage(from: session).jsonObject }
         if !schemaWarnings.isEmpty { json["schemaWarnings"] = schemaWarnings }
 
         if !toolCalls.isEmpty {
@@ -2900,25 +2876,22 @@ private func handleToolsMode(
         }
 
         var prev = ""
-        for try await cumulative in makeTextStream(session: session, context: context) {
-            // Observe cancellation between chunks even if the framework's sequence is slow to.
-            try Task.checkCancellation()
+        do {
+            for try await cumulative in makeTextStream(session: session, context: context) {
+                // Observe cancellation between chunks even if the framework's sequence is slow to.
+                try Task.checkCancellation()
 
-            // Check for early termination only if enabled
-            if stopAfterToolCalls,
-                let coordinator,
-                await coordinator.shouldTerminateStream()
-            {
-                break
+                let delta = streamDelta(previous: prev, current: cumulative.content)
+                prev = cumulative.content
+                guard !delta.isEmpty else { continue }
+
+                delta.withCString { cStr in
+                    onChunk(strdup(cStr))
+                }
             }
-
-            let delta = streamDelta(previous: prev, current: cumulative.content)
-            prev = cumulative.content
-            guard !delta.isEmpty else { continue }
-
-            delta.withCString { cStr in
-                onChunk(strdup(cStr))
-            }
+        } catch where isToolRoundComplete(error) {
+            // The model called a tool, which ends the stream (see `JSProxyTool.call`). The host
+            // was handed each call through `jsToolCallback` and emits them at end-of-stream.
         }
 
         // Signal completion

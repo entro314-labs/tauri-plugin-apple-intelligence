@@ -388,7 +388,6 @@ export class AppleIntelligenceChatLanguageModel implements LanguageModelV4 {
           topP: call.topP,
           topK: call.topK,
           seed: call.seed,
-          stopAfterToolCalls: call.tools?.length ? true : undefined,
           abortSignal: options.abortSignal,
         }),
         call.warnings
@@ -593,7 +592,6 @@ export class AppleIntelligenceChatLanguageModel implements LanguageModelV4 {
         topP: call.topP,
         topK: call.topK,
         seed: call.seed,
-        stopAfterToolCalls: true,
       });
     } catch (error) {
       return this.finishFromError(error, call.warnings);

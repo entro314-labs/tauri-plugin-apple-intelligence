@@ -85,7 +85,6 @@ pub struct AppleAIGenerateRequest {
     /// `GenerationOptions.ToolCallingMode` on macOS 27+; best-effort ignored on macOS 26.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<String>,
-    pub stop_after_tool_calls: Option<bool>,
 }
 
 /// Token usage for one generation. All counts are `0` on macOS 26 (which does not report per-call
