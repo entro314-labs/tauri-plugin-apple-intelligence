@@ -69,11 +69,6 @@ fn wait_for_end(log: &EventLog, timeout: Duration) -> bool {
     true
 }
 
-/// The plugin serializes streams — one active at a time, host-wide — so the streaming tests in this
-/// binary (which `cargo test` runs on parallel threads) have to take turns or the second one is
-/// rejected with `StreamBusy`.
-static STREAM_SLOT: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 fn request(prompt: &str) -> AppleAIGenerateRequest {
     AppleAIGenerateRequest {
         messages: vec![AppleAIMessage {
@@ -104,9 +99,6 @@ fn request(prompt: &str) -> AppleAIGenerateRequest {
 #[test]
 #[ignore = "requires the on-device Apple Intelligence model — run locally with --ignored"]
 fn webview_stream_command_accepts_a_channel() {
-    let _slot = STREAM_SLOT
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
     // The mock context ships an empty ACL, so the plugin commands under test are allowed
     // explicitly (a real app grants them via the `apple-intelligence:default` permission).
     let mut context = tauri::test::mock_context(tauri::test::noop_assets());
@@ -166,9 +158,8 @@ fn webview_stream_command_accepts_a_channel() {
         .to_string();
     eprintln!("channel-backed stream started: {stream_id}");
 
-    // Cancel through the same IPC surface, then wait for the slot to free (the cancelled task's
-    // terminal event releases it) so the next test can stream.
-    let _ = tauri::test::get_ipc_response(
+    // Cancel through the same IPC surface.
+    let cancelled = tauri::test::get_ipc_response(
         &webview,
         tauri::webview::InvokeRequest {
             cmd: "plugin:apple-intelligence|cancel_stream".into(),
@@ -180,32 +171,18 @@ fn webview_stream_command_accepts_a_channel() {
             invoke_key: tauri::test::INVOKE_KEY.to_string(),
         },
     )
-    .expect("cancel command");
-
-    let ai = app.handle().apple_intelligence();
-    let deadline = Instant::now() + Duration::from_secs(90);
-    let (_, second) = loop {
-        match stream_logged(ai, request("Reply with exactly: ok")) {
-            Ok(started) => break started,
-            Err(_) => {
-                assert!(
-                    Instant::now() < deadline,
-                    "the cancelled channel stream never released the slot"
-                );
-                std::thread::sleep(Duration::from_millis(100));
-            }
-        }
-    };
-    // Let the follow-up stream finish so the process exits with a quiet runtime.
-    wait_for_end(&second, Duration::from_secs(60));
+    .expect("cancel command")
+    .deserialize::<bool>()
+    .expect("cancel result");
+    assert!(
+        cancelled,
+        "cancel_stream must find the channel-backed stream"
+    );
 }
 
 #[test]
 #[ignore = "requires the on-device Apple Intelligence model — run locally with --ignored"]
-fn cancel_frees_the_stream_slot_and_emits_done() {
-    let _slot = STREAM_SLOT
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
+fn cancel_ends_the_stream_with_done() {
     let app = tauri::test::mock_builder()
         .plugin(tauri_plugin_apple_intelligence::init())
         .build(tauri::test::mock_context(tauri::test::noop_assets()))
@@ -248,16 +225,69 @@ fn cancel_frees_the_stream_slot_and_emits_done() {
         "cancelled stream must not emit an error event"
     );
 
-    // …and must free the single-flight slot: a second stream starts without StreamBusy.
-    let (_, second) =
-        stream_logged(ai, request("Reply with exactly: ok")).expect("slot freed after cancel");
-
-    // A stale cancel for the finished first stream is a no-op and never touches the second.
+    // A stale cancel for the finished stream is a no-op.
     let stale = ai.cancel_stream(&start.stream_id).expect("stale cancel");
     assert!(!stale, "stale cancel must be a no-op");
+}
 
-    // Let the tiny second stream finish so the process exits with a quiet runtime.
-    wait_for_end(&second, Duration::from_secs(30));
+/// Streams run concurrently, each receiving only its own events, and cancelling one leaves the
+/// other running. The plugin used to route every chunk through one global slot: a second stream
+/// was refused with `StreamBusy` until the first finished.
+#[test]
+#[ignore = "requires the on-device Apple Intelligence model — run locally with --ignored"]
+fn concurrent_streams_are_routed_and_cancelled_independently() {
+    let app = tauri::test::mock_builder()
+        .plugin(tauri_plugin_apple_intelligence::init())
+        .build(tauri::test::mock_context(tauri::test::noop_assets()))
+        .expect("mock app with plugin");
+    let ai = app.handle().apple_intelligence();
+    let availability = ai.check_availability().expect("availability");
+    if !availability.available {
+        eprintln!("SKIP: model unavailable ({})", availability.reason);
+        return;
+    }
+
+    let (long, long_events) = stream_logged(
+        ai,
+        request("Write a 2000 word essay about the history of the ocean."),
+    )
+    .expect("first stream");
+    let (_, short_events) = stream_logged(ai, request("Reply with exactly the word: pelican"))
+        .expect("a second stream starts while the first is running");
+
+    assert!(
+        wait_for(&long_events, "text", Duration::from_secs(90)),
+        "the first stream produced no text: {:?}",
+        kinds(&long_events)
+    );
+    assert!(ai.cancel_stream(&long.stream_id).expect("cancel"));
+    assert!(
+        wait_for(&long_events, "done", Duration::from_secs(10)),
+        "the cancelled stream did not end: {:?}",
+        kinds(&long_events)
+    );
+
+    assert!(
+        wait_for_end(&short_events, Duration::from_secs(90)),
+        "the second stream never ended"
+    );
+    let short = short_events.lock().unwrap().clone();
+    let short_text: String = short
+        .iter()
+        .filter(|event| event["type"] == "text")
+        .filter_map(|event| event["text"].as_str())
+        .collect();
+    eprintln!("second stream: {short_text:?}");
+    assert!(
+        kinds(&short_events)
+            .last()
+            .is_some_and(|kind| kind == "done"),
+        "cancelling the first stream must not end the second: {short:?}"
+    );
+    assert!(
+        short_text.to_lowercase().contains("pelican") && !short_text.contains("ocean"),
+        "each stream must receive only its own text: {short_text:?}"
+    );
 }
 
 /// A stream that fails before producing anything still delivers its terminal `error` to the Rust
@@ -267,9 +297,6 @@ fn cancel_frees_the_stream_slot_and_emits_done() {
 #[test]
 #[ignore = "requires macOS with FoundationModels — run locally with --ignored"]
 fn an_immediate_stream_error_is_not_lost() {
-    let _slot = STREAM_SLOT
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
     let app = tauri::test::mock_builder()
         .plugin(tauri_plugin_apple_intelligence::init())
         .build(tauri::test::mock_context(tauri::test::noop_assets()))
@@ -303,9 +330,6 @@ fn an_immediate_stream_error_is_not_lost() {
 #[test]
 #[ignore = "requires the on-device Apple Intelligence model — run locally with --ignored"]
 fn dropped_tool_properties_are_reported_on_the_stream() {
-    let _slot = STREAM_SLOT
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
     let app = tauri::test::mock_builder()
         .plugin(tauri_plugin_apple_intelligence::init())
         .build(tauri::test::mock_context(tauri::test::noop_assets()))
@@ -375,4 +399,66 @@ fn dropped_tool_properties_are_reported_on_the_stream() {
         first_warning < first_content,
         "warnings must precede any answer content so they can ride on `stream-start`: {seen:?}"
     );
+}
+
+/// A streamed tool round ends the stream and arrives as `tool-call` events ahead of `done` — one per
+/// call the model made, with parsed arguments, and nothing invented after the first round.
+#[test]
+#[ignore = "requires the on-device Apple Intelligence model — run locally with --ignored"]
+fn a_streamed_tool_round_ends_the_stream() {
+    let app = tauri::test::mock_builder()
+        .plugin(tauri_plugin_apple_intelligence::init())
+        .build(tauri::test::mock_context(tauri::test::noop_assets()))
+        .expect("mock app with plugin");
+    let ai = app.handle().apple_intelligence();
+    let availability = ai.check_availability().expect("availability");
+    if !availability.available {
+        eprintln!("SKIP: model unavailable ({})", availability.reason);
+        return;
+    }
+
+    let mut streamed = request(
+        "First find out which city I live in with get_user_city, then tell me the weather there \
+         using get_weather.",
+    );
+    streamed.temperature = Some(0.0);
+    streamed.tools = Some(vec![
+        AppleAIToolDefinition {
+            name: "get_user_city".to_string(),
+            description: Some(
+                "Returns the city the user lives in. Takes no arguments.".to_string(),
+            ),
+            parameters: serde_json::json!({"type": "object", "properties": {}}),
+        },
+        AppleAIToolDefinition {
+            name: "get_weather".to_string(),
+            description: Some("Returns the current weather for a city.".to_string()),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"],
+            }),
+        },
+    ]);
+    let (_, events) = stream_logged(ai, streamed).expect("stream start");
+    assert!(
+        wait_for_end(&events, Duration::from_secs(90)),
+        "the stream never ended"
+    );
+    let logged = events.lock().unwrap().clone();
+    eprintln!("streamed tool round: {logged:?}");
+    let calls: Vec<&serde_json::Value> = logged
+        .iter()
+        .filter(|event| event["type"] == "tool-call")
+        .collect();
+    assert_eq!(calls.len(), 1, "exactly the first round's call: {logged:?}");
+    assert_eq!(calls[0]["toolName"], "get_user_city");
+    assert!(calls[0]["args"].is_object(), "arguments arrive parsed");
+    assert!(
+        calls[0]["toolCallId"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("call_")),
+        "streamed calls carry the same id format as generated ones"
+    );
+    assert_eq!(kinds(&events).last().map(String::as_str), Some("done"));
 }

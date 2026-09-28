@@ -13,9 +13,6 @@ pub enum AppleAIError {
     NativeError {
         message: String,
     },
-    StreamBusy {
-        message: String,
-    },
     InvalidPayload {
         message: String,
     },
@@ -46,7 +43,6 @@ impl std::fmt::Display for AppleAIError {
         match self {
             AppleAIError::UnsupportedPlatform { message }
             | AppleAIError::NativeError { message }
-            | AppleAIError::StreamBusy { message }
             | AppleAIError::InvalidPayload { message } => write!(f, "{message}"),
             AppleAIError::Generation { code, message, .. } => write!(f, "[{code}] {message}"),
         }

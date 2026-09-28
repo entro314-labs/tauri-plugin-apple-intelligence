@@ -232,9 +232,9 @@ function makeTransport(overrides = {}) {
   assert.equal(plain.message, "dylib exploded");
   assert.ok(!(plain instanceof AppleIntelligenceGenerationError));
 
-  const stringReason = toAppleIntelligenceError("[stream-busy] a stream is already active");
+  const stringReason = toAppleIntelligenceError("[rate-limited] too many requests");
   assert.ok(stringReason instanceof AppleIntelligenceGenerationError);
-  assert.equal(stringReason.code, "stream-busy");
+  assert.equal(stringReason.code, "rate-limited");
 
   const unknownShape = toAppleIntelligenceError({ weird: true, nested: { n: 1 } });
   assert.ok(!unknownShape.message.includes("[object Object]"), "must not stringify to [object Object]");
@@ -367,8 +367,9 @@ function makeTransport(overrides = {}) {
 
 // 13. The Tauri transport cancels a stream its consumer abandons. Without this, a consumer that
 // stops reading (a `break`, a cancelled ReadableStream) left the generation running to completion
-// on the host's single stream slot, and the next stream was refused with `stream-busy`. A stream
-// read to its terminal event is never cancelled.
+// on the host, spending inference on output nobody reads (and, before streams ran concurrently,
+// blocking the next stream with `stream-busy`). A stream read to its terminal event is never
+// cancelled.
 {
   globalThis.window ??= globalThis;
   const { mockIPC, clearMocks } = await import("@tauri-apps/api/mocks");

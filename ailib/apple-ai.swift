@@ -1332,76 +1332,70 @@ private func createToolOutputEntry(from message: ChatMessage) -> [Transcript.Ent
     return entries
 }
 
-// Streaming callback sentinel prefixes. A chunk's first byte tags its channel; untagged chunks are
-// plain answer-text deltas. The Rust host decodes the same table:
-//   0x02  error         — the remainder is a JSON error object: {code, message, contextSize?, tokenCount?}
-//   0x03  reasoning      — the remainder is a reasoning/chain-of-thought text delta (reserved)
-//   0x04  usage          — the remainder is a JSON usage object, emitted once before end-of-stream
-//   0x05  warning        — the remainder is a plain-text warning (e.g. a property dropped from a
-//                          tool's guide), emitted before the first answer token
+// Streaming chunk tags. A chunk's first byte tags its channel; untagged chunks are plain
+// answer-text deltas. The Rust host decodes the same table:
+//   0x02  error       — the remainder is a JSON error object: {code, message, contextSize?,
+//                       tokenCount?}. Terminal: nothing follows it.
+//   0x03  reasoning   — the remainder is a reasoning/chain-of-thought text delta (reserved)
+//   0x04  usage       — the remainder is a JSON usage object, sent once before end-of-stream
+//   0x05  warning     — the remainder is a plain-text warning (e.g. a property dropped from a
+//                       tool's guide), sent before the first answer token
+//   0x06  tool calls  — the remainder is a JSON array of the round's tool calls, in the same
+//                       shape as the non-streaming result's `toolCalls`, sent before end-of-stream
+// A nil chunk is the clean end-of-stream. Every stream ends with exactly one nil or error chunk.
 private let ERROR_SENTINEL: Character = "\u{0002}"
 private let REASONING_SENTINEL: Character = "\u{0003}"
 private let USAGE_SENTINEL: Character = "\u{0004}"
 private let WARNING_SENTINEL: Character = "\u{0005}"
+private let TOOL_CALLS_SENTINEL: Character = "\u{0006}"
 
-@available(macOS 26.0, *)
-@inline(__always)
-private func emitError(
-    _ error: BridgeError, to onChunk: (@convention(c) (UnsafePointer<CChar>?) -> Void)
-) {
-    let full = String(ERROR_SENTINEL) + error.streamJson
-    full.withCString { cStr in
-        onChunk(strdup(cStr))
+/// The host's chunk callback. `context` is the opaque per-stream pointer the host passed to
+/// `apple_ai_generate_unified`, handed back on every chunk so the host can route it to the right
+/// stream. The chunk pointer is only valid for the duration of the call.
+public typealias StreamChunkCallback =
+    @convention(c) (_ context: UnsafeMutableRawPointer?, _ chunk: UnsafePointer<CChar>?) -> Void
+
+/// Where one stream's chunks go: the host's callback and the context that identifies the stream.
+private struct ChunkSink: @unchecked Sendable {
+    let context: UnsafeMutableRawPointer?
+    let callback: StreamChunkCallback
+
+    func send(_ chunk: String) {
+        chunk.withCString { callback(context, $0) }
+    }
+
+    func send(_ tag: Character, json object: Any) {
+        guard let data = try? JSONSerialization.data(withJSONObject: object),
+            let json = String(data: data, encoding: .utf8)
+        else { return }
+        send(String(tag) + json)
+    }
+
+    /// Terminal: the stream failed.
+    func fail(_ error: BridgeError) {
+        send(String(ERROR_SENTINEL) + error.streamJson)
+    }
+
+    /// Terminal: the stream ended cleanly.
+    func end() {
+        callback(context, nil)
+    }
+
+    /// A non-fatal warning; generation continues. Used for the properties a tool's schema declares
+    /// but the guide had to drop, which the host turns into an AI SDK call warning.
+    func warn(_ message: String) {
+        send(String(WARNING_SENTINEL) + message)
+    }
+
+    /// The token-usage summary, sent just before end-of-stream. No-op when usage is absent
+    /// (macOS 26, which does not report per-call token counts).
+    func usage(_ usage: UsageInfo?) {
+        guard let usage else { return }
+        send(USAGE_SENTINEL, json: usage.jsonObject)
     }
 }
 
-/// Emit a non-fatal warning on the stream — generation continues. Used for the properties a tool's
-/// schema declares but the guide had to drop, which the host turns into an AI SDK call warning; the
-/// alternative (saying nothing) is the silent degradation this converter exists to avoid.
-@available(macOS 26.0, *)
-@inline(__always)
-private func emitWarning(
-    _ message: String, to onChunk: (@convention(c) (UnsafePointer<CChar>?) -> Void)
-) {
-    let full = String(WARNING_SENTINEL) + message
-    full.withCString { cStr in
-        onChunk(strdup(cStr))
-    }
-}
-
-/// Emit a token-usage summary on the stream just before end-of-stream. No-op when usage is absent
-/// (e.g. macOS 26, which does not report per-call token counts).
-@inline(__always)
-private func emitUsage(
-    _ usage: UsageInfo?, to onChunk: (@convention(c) (UnsafePointer<CChar>?) -> Void)
-) {
-    guard let usage,
-        let data = try? JSONSerialization.data(withJSONObject: usage.jsonObject),
-        let json = String(data: data, encoding: .utf8)
-    else { return }
-    let full = String(USAGE_SENTINEL) + json
-    full.withCString { cStr in
-        onChunk(strdup(cStr))
-    }
-}
-
-// MARK: - JS Tool Callback Bridge
-
-// Simple async callback - Rust calls this, expects result via separate callback
-public typealias JSToolCallback =
-    @convention(c) (
-        _ toolID: UInt64, _ argsJson: UnsafePointer<CChar>
-    ) -> Void
-
-private var jsToolCallback: JSToolCallback?
-
-// Expose a C function so Rust can register the async callback
-@_cdecl("apple_ai_register_tool_callback")
-public func appleAIRegisterToolCallback(_ cb: JSToolCallback?) {
-    jsToolCallback = cb
-}
-
-// MARK: - Proxy Tool implementation bridging to JS
+// MARK: - Proxy Tool
 
 @available(macOS 26.0, *)
 private struct JSArguments: ConvertibleFromGeneratedContent {
@@ -1415,7 +1409,6 @@ private struct JSArguments: ConvertibleFromGeneratedContent {
 private struct JSProxyTool: Tool {
     typealias Arguments = JSArguments
 
-    let toolID: UInt64
     let name: String
     let description: String
     let parametersSchema: GenerationSchema
@@ -1431,19 +1424,11 @@ private struct JSProxyTool: Tool {
     /// user's city and then fetch that city's weather, it called `get_weather("New York")` — an
     /// argument built on an output it never received — and the host executed that call too.
     func call(arguments: JSArguments) async throws -> String {
-        let jsonObj = generatedContentToJSON(arguments.raw)
-
-        // Streaming requests hand the call to the host as it happens.
-        if let cb = jsToolCallback,
-            let data = try? JSONSerialization.data(withJSONObject: jsonObj),
-            let jsonStr = String(data: data, encoding: .utf8)
-        {
-            jsonStr.withCString { cb(toolID, $0) }
-        }
-
         // Recorded before throwing, so every call of a parallel tool round is collected even
         // though the first throw ends the round.
-        collector.append(id: toolID, name: name, arguments: jsonObj as? [String: Any] ?? [:])
+        collector.append(
+            name: name,
+            arguments: generatedContentToJSON(arguments.raw) as? [String: Any] ?? [:])
         throw ToolRoundComplete()
     }
 }
@@ -1460,44 +1445,6 @@ private func isToolRoundComplete(_ error: Error) -> Bool {
         return toolError.underlyingError is ToolRoundComplete
     }
     return false
-}
-
-// MARK: - Tool Definition Structure
-
-private struct ToolDefinition: Codable {
-    let name: String
-    let description: String?
-    let parameters: [String: Any]?
-
-    enum CodingKeys: String, CodingKey {
-        case name
-        case description
-        case parameters
-    }
-
-    init(from decoder: Decoder) throws {
-        let container = try decoder.container(keyedBy: CodingKeys.self)
-        name = try container.decode(String.self, forKey: .name)
-        description = try container.decodeIfPresent(String.self, forKey: .description)
-
-        // Decode parameters as generic JSON
-        if container.contains(.parameters) {
-            let parametersValue = try container.decode(AnyCodable.self, forKey: .parameters)
-            parameters = parametersValue.value as? [String: Any]
-        } else {
-            parameters = nil
-        }
-    }
-
-    func encode(to encoder: Encoder) throws {
-        var container = encoder.container(keyedBy: CodingKeys.self)
-        try container.encode(name, forKey: .name)
-        try container.encodeIfPresent(description, forKey: .description)
-
-        if let params = parameters {
-            try container.encode(AnyCodable(params), forKey: .parameters)
-        }
-    }
 }
 
 // Helper for decoding arbitrary JSON
@@ -2354,7 +2301,7 @@ private func buildSchemasFromJson(_ json: [String: Any]) throws -> (
     return (root, context.dependencies, context.omissions)
 }
 
-// MARK: - Tool Call Collection for Natural Completion
+// MARK: - Tool Call Collection
 
 /// Per-request collector for the tool calls one generation makes. One instance per request —
 /// the old process-wide singleton let concurrent requests mix their tool calls into each
@@ -2362,28 +2309,34 @@ private func buildSchemasFromJson(_ json: [String: Any]) throws -> (
 @available(macOS 26.0, *)
 private final class ToolCallCollector: @unchecked Sendable {
     private let queue = DispatchQueue(label: "tool.call.collector")
-    private var calls: [ToolCallRecord] = []
+    private var calls: [[String: Any]] = []
 
-    struct ToolCallRecord {
-        let id: UInt64
-        let name: String
-        let arguments: [String: Any]
-        let callId: String
+    /// Record one call in the OpenAI shape both result channels carry:
+    /// `{id, type: "function", function: {name, arguments}}`, `arguments` a JSON string.
+    func append(name: String, arguments: [String: Any]) {
+        let id = "call_\(UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(12))"
+        let argumentsJson =
+            (try? JSONSerialization.data(withJSONObject: arguments))
+            .flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
+        let call: [String: Any] = [
+            "id": id,
+            "type": "function",
+            "function": ["name": name, "arguments": argumentsJson],
+        ]
+        queue.sync { calls.append(call) }
     }
 
-    func append(id: UInt64, name: String, arguments: [String: Any]) {
-        let callId = "call_\(UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(12))"
-        let record = ToolCallRecord(id: id, name: name, arguments: arguments, callId: callId)
-        queue.sync { calls.append(record) }
-    }
-
-    func getAllCalls() -> [ToolCallRecord] {
+    var all: [[String: Any]] {
         queue.sync { calls }
     }
 }
 
 // MARK: - Unified Generation Function
 
+/// Run one generation. Without `onChunk` it blocks and returns the JSON result (or
+/// `{"error": {...}}`), which the caller frees with `apple_ai_free_string`. With `onChunk` it
+/// streams: it registers the generation under `streamID` (for `apple_ai_cancel_stream`), returns
+/// `nil` immediately, and delivers every chunk to `onChunk` along with `streamContext`.
 @available(macOS 26.0, *)
 @_cdecl("apple_ai_generate_unified")
 public func appleAIGenerateUnified(
@@ -2393,8 +2346,9 @@ public func appleAIGenerateUnified(
     model: UnsafePointer<CChar>?,  // "on-device" (default) | "private-cloud"
     reasoningLevel: UnsafePointer<CChar>?,  // nil | "light" | "moderate" | "deep" | custom
     optionsJson: UnsafePointer<CChar>?,  // JSON: {temperature?, topP?, topK?, seed?, maxTokens?, toolChoice?}
-    stream: Bool,
-    onChunk: (@convention(c) (UnsafePointer<CChar>?) -> Void)?
+    streamID: UnsafePointer<CChar>?,
+    streamContext: UnsafeMutableRawPointer?,
+    onChunk: StreamChunkCallback?
 ) -> UnsafeMutablePointer<CChar>? {
     let messagesJsonString = String(cString: messagesJson)
     let toolsJsonString = toolsJson.map { String(cString: $0) }
@@ -2403,16 +2357,7 @@ public func appleAIGenerateUnified(
     let reasoningLevelString = reasoningLevel.map { String(cString: $0) }
     let optionsJsonString = optionsJson.map { String(cString: $0) }
 
-    // Validate streaming parameters
-    if stream && onChunk == nil {
-        return strdup(
-            BridgeError(
-                code: "invalid-json", message: "Streaming requested but no callback provided"
-            ).resultJson)
-    }
-
-    // For non-streaming mode, use a semaphore
-    if !stream {
+    guard let onChunk else {
         let semaphore = DispatchSemaphore(value: 0)
         var result: String =
             BridgeError(code: "unknown", message: "No response").resultJson
@@ -2431,11 +2376,7 @@ public func appleAIGenerateUnified(
                 if let toolsStr = toolsJsonString, !toolsStr.isEmpty {
                     // Tools mode - takes precedence over schema
                     result = try await handleToolsMode(
-                        context: context,
-                        toolsJsonString: toolsStr,
-                        streaming: false,
-                        onChunk: nil
-                    )
+                        context: context, toolsJsonString: toolsStr, sink: nil)
                 } else if let schemaStr = schemaJsonString, !schemaStr.isEmpty {
                     // Structured generation mode
                     result = try await handleStructuredMode(
@@ -2456,104 +2397,94 @@ public func appleAIGenerateUnified(
 
         semaphore.wait()
         return strdup(result)
-    } else {
-        // Streaming mode. The task handle is registered so `apple_ai_cancel_stream` can cancel a
-        // superseded stream (typing-driven completions abort constantly); the host enforces one
-        // active stream at a time, so a single slot is sufficient.
-        let task = Task.detached {
-            defer { StreamTaskRegistry.shared.clear() }
-            do {
-                // Parse messages and prepare context
-                let context = try prepareConversationContext(
-                    messagesJsonString: messagesJsonString,
-                    optionsJsonString: optionsJsonString,
-                    modelKind: modelKind,
-                    reasoningLevel: reasoningLevelString
-                )
-
-                try Task.checkCancellation()
-
-                // Determine operation mode and stream
-                if let toolsStr = toolsJsonString, !toolsStr.isEmpty {
-                    // Tools mode with streaming
-                    _ = try await handleToolsMode(
-                        context: context,
-                        toolsJsonString: toolsStr,
-                        streaming: true,
-                        onChunk: onChunk
-                    )
-                } else if let schemaStr = schemaJsonString, !schemaStr.isEmpty {
-                    // Structured generation doesn't support streaming (the host simulates a
-                    // stream from the non-streaming structured path instead).
-                    emitError(
-                        BridgeError(
-                            code: "unsupported-capability",
-                            message: "Structured generation does not support streaming"),
-                        to: onChunk!)
-                } else {
-                    // Basic generation with streaming
-                    try await handleBasicModeStream(
-                        context: context,
-                        onChunk: onChunk!
-                    )
-                }
-            } catch is CancellationError {
-                // Cancelled by the host (superseded/aborted stream): terminate cleanly so the
-                // consumer sees a normal end-of-stream, not an error.
-                onChunk!(nil)
-            } catch let error as ConversationError {
-                emitError(mapConversationError(error), to: onChunk!)
-            } catch {
-                emitError(mapToBridgeError(error), to: onChunk!)
-            }
-        }
-        StreamTaskRegistry.shared.store(task)
-        return nil  // Streaming returns immediately
     }
+
+    let sink = ChunkSink(context: streamContext, callback: onChunk)
+    StreamTaskRegistry.shared.start(id: streamID.map { String(cString: $0) } ?? "") {
+        do {
+            // Parse messages and prepare context
+            let context = try prepareConversationContext(
+                messagesJsonString: messagesJsonString,
+                optionsJsonString: optionsJsonString,
+                modelKind: modelKind,
+                reasoningLevel: reasoningLevelString
+            )
+
+            try Task.checkCancellation()
+
+            // Determine operation mode and stream
+            if let toolsStr = toolsJsonString, !toolsStr.isEmpty {
+                _ = try await handleToolsMode(
+                    context: context, toolsJsonString: toolsStr, sink: sink)
+            } else if let schemaStr = schemaJsonString, !schemaStr.isEmpty {
+                // Structured generation doesn't support streaming (the host simulates a
+                // stream from the non-streaming structured path instead).
+                sink.fail(
+                    BridgeError(
+                        code: "unsupported-capability",
+                        message: "Structured generation does not support streaming"))
+            } else {
+                try await handleBasicModeStream(context: context, sink: sink)
+            }
+        } catch is CancellationError {
+            // Cancelled by the host (superseded/aborted stream): terminate cleanly so the
+            // consumer sees a normal end-of-stream, not an error.
+            sink.end()
+        } catch let error as ConversationError {
+            sink.fail(mapConversationError(error))
+        } catch {
+            sink.fail(mapToBridgeError(error))
+        }
+    }
+    return nil  // Streaming returns immediately
 }
 
 // MARK: - Stream cancellation
 
-/// Single-slot registry for the in-flight streaming task. The Rust host serializes streams (one
-/// active at a time), so one slot mirrors reality; `store` cancels any straggler it replaces.
+/// The in-flight streaming tasks, by the host's stream id, so any one of several concurrent
+/// streams can be cancelled.
 private final class StreamTaskRegistry: @unchecked Sendable {
     static let shared = StreamTaskRegistry()
 
     private let lock = NSLock()
-    private var current: Task<Void, Never>?
+    private var tasks: [String: Task<Void, Never>] = [:]
 
-    func store(_ task: Task<Void, Never>) {
+    /// Run `body` as a detached task registered under `id`. The task is created and registered
+    /// under the lock, and its own deregistration takes the same lock — so it can never finish
+    /// and deregister before it was registered (which would leave a dead entry behind), and
+    /// `cancel(id)` finds it from the moment `apple_ai_generate_unified` returns.
+    func start(id: String, _ body: @escaping @Sendable () async -> Void) {
         lock.lock()
-        let previous = current
-        current = task
-        lock.unlock()
-        previous?.cancel()
+        defer { lock.unlock() }
+        tasks[id] = Task.detached {
+            await body()
+            StreamTaskRegistry.shared.remove(id)
+        }
     }
 
-    /// Cancel the in-flight stream, if any. Returns whether a task was cancelled. The cancelled
-    /// task itself reports the clean end-of-stream (`onChunk(nil)`) from its CancellationError
-    /// handler, so callers must not synthesize a terminal chunk here.
-    func cancel() -> Bool {
+    /// Cancel the stream registered under `id`. Returns whether one was found. The cancelled
+    /// task reports its own clean end-of-stream from its CancellationError handler, so callers
+    /// must not synthesize a terminal chunk.
+    func cancel(_ id: String) -> Bool {
         lock.lock()
-        let task = current
+        let task = tasks[id]
         lock.unlock()
-        guard let task else { return false }
-        task.cancel()
-        return true
+        task?.cancel()
+        return task != nil
     }
 
-    func clear() {
+    private func remove(_ id: String) {
         lock.lock()
-        current = nil
+        tasks[id] = nil
         lock.unlock()
     }
 }
 
-/// Cancel the currently active streaming generation, if any. Safe to call at any time; a stream
+/// Cancel the streaming generation registered under `streamID`. Safe to call at any time; a stream
 /// that already finished is a no-op (`false`).
 @_cdecl("apple_ai_cancel_stream")
-public func appleAICancelStream() -> Bool {
-    return StreamTaskRegistry.shared.cancel()
+public func appleAICancelStream(streamID: UnsafePointer<CChar>) -> Bool {
+    return StreamTaskRegistry.shared.cancel(String(cString: streamID))
 }
 
 // MARK: - Helper functions for unified generation
@@ -2676,7 +2607,7 @@ private func handleBasicMode(context: ConversationContext) async throws -> Strin
 @available(macOS 26.0, *)
 private func handleBasicModeStream(
     context: ConversationContext,
-    onChunk: @convention(c) (UnsafePointer<CChar>?) -> Void
+    sink: ChunkSink
 ) async throws {
     let transcript = makeTranscript(context: context)
     debugPrintTranscript(transcript, prompt: context.currentPrompt)
@@ -2690,15 +2621,12 @@ private func handleBasicModeStream(
         let delta = streamDelta(previous: prev, current: cumulative.content)
         prev = cumulative.content
         guard !delta.isEmpty else { continue }
-
-        delta.withCString { cStr in
-            onChunk(strdup(cStr))
-        }
+        sink.send(delta)
     }
     if #available(macOS 27.0, *) {
-        emitUsage(readUsage(from: session), to: onChunk)
+        sink.usage(readUsage(from: session))
     }
-    onChunk(nil)  // Signal end of stream
+    sink.end()
 }
 
 /// Default output-token cap for structured generation when the caller sets no `maxTokens`.
@@ -2755,12 +2683,15 @@ private func handleStructuredMode(
     return String(data: jsonData, encoding: .utf8) ?? "Error: Encoding failure"
 }
 
+/// Tool-calling generation. With a `sink` it streams; without one it returns the JSON result.
+/// Either way a tool call ends the generation (see `JSProxyTool.call`), and the round's calls come
+/// back through this request's collector: as `toolCalls` in the result, or as one tool-calls chunk
+/// before end-of-stream.
 @available(macOS 26.0, *)
 private func handleToolsMode(
     context: ConversationContext,
     toolsJsonString: String,
-    streaming: Bool,
-    onChunk: (@convention(c) (UnsafePointer<CChar>?) -> Void)?
+    sink: ChunkSink?
 ) async throws -> String {
     // Parse tools
     guard let toolsData = toolsJsonString.data(using: .utf8),
@@ -2778,19 +2709,18 @@ private func handleToolsMode(
     // guided generation cannot express). Attributed per tool, since a request carries several.
     var schemaWarnings: [String] = []
     for dict in rawToolsArr {
-        guard let idNum = dict["id"] as? UInt64,
-            let name = dict["name"] as? String
-        else { continue }
+        guard let name = dict["name"] as? String else {
+            throw ConversationError.invalidJSON("A tool definition has no name")
+        }
         let description = dict["description"] as? String ?? ""
         let paramsSchemaJson = dict["parameters"] as? [String: Any] ?? [:]
         let (root, deps, warnings) = try buildSchemasFromJson(paramsSchemaJson)
         schemaWarnings.append(contentsOf: warnings.map { "Tool \"\(name)\": \($0)" })
         let genSchema = try GenerationSchema(root: root, dependencies: deps)
-        let proxy = JSProxyTool(
-            toolID: idNum, name: name, description: description, parametersSchema: genSchema,
-            collector: collector
-        )
-        tools.append(proxy)
+        tools.append(
+            JSProxyTool(
+                name: name, description: description, parametersSchema: genSchema,
+                collector: collector))
     }
 
     // Build the transcript: prior turns behind an Instructions entry carrying the system prompt
@@ -2805,80 +2735,58 @@ private func handleToolsMode(
     debugPrintTranscript(transcript, prompt: context.currentPrompt)
     let session = try makeSession(modelKind: context.modelKind, tools: tools, transcript: transcript)
 
-    if !streaming {
-        // Non-streaming with tools. `respondText` honors reasoning level / image attachments. A
-        // tool call ends the generation (see `JSProxyTool.call`) and comes back through this
-        // request's collector.
+    guard let sink else {
+        // `respondText` honors reasoning level / image attachments.
         var text = ""
         do {
             text = try await respondText(session: session, context: context).text
         } catch where isToolRoundComplete(error) {
             // The model called a tool; the collected calls are the result.
         }
-        let toolCalls = collector.getAllCalls()
+        let toolCalls = collector.all
 
         var json: [String: Any] = [:]
         if #available(macOS 27.0, *) { json["usage"] = readUsage(from: session).jsonObject }
         if !schemaWarnings.isEmpty { json["schemaWarnings"] = schemaWarnings }
-
-        if !toolCalls.isEmpty {
-            let formattedCalls = toolCalls.map { call in
-                [
-                    "id": call.callId,
-                    "type": "function",
-                    "function": [
-                        "name": call.name,
-                        "arguments":
-                            (try? String(
-                                data: JSONSerialization.data(withJSONObject: call.arguments),
-                                encoding: .utf8)) ?? "{}",
-                    ],
-                ]
-            }
-            json["text"] = ""  // awaiting tool execution
-            json["toolCalls"] = formattedCalls
-        } else {
+        if toolCalls.isEmpty {
             json["text"] = text
+        } else {
+            json["text"] = ""  // awaiting tool execution
+            json["toolCalls"] = toolCalls
         }
 
         let jsonData = try JSONSerialization.data(withJSONObject: json, options: [])
         return String(data: jsonData, encoding: .utf8) ?? "Error: Encoding failure"
-    } else {
-        // Streaming with tools
-        guard let onChunk = onChunk else {
-            throw ConversationError.invalidJSON("No callback provided for streaming")
-        }
-
-        // Emitted before the first answer token so the host can attach them to the stream's
-        // `stream-start` warnings, which is the only place the AI SDK protocol carries warnings.
-        for warning in schemaWarnings {
-            emitWarning(warning, to: onChunk)
-        }
-
-        var prev = ""
-        do {
-            for try await cumulative in makeTextStream(session: session, context: context) {
-                // Observe cancellation between chunks even if the framework's sequence is slow to.
-                try Task.checkCancellation()
-
-                let delta = streamDelta(previous: prev, current: cumulative.content)
-                prev = cumulative.content
-                guard !delta.isEmpty else { continue }
-
-                delta.withCString { cStr in
-                    onChunk(strdup(cStr))
-                }
-            }
-        } catch where isToolRoundComplete(error) {
-            // The model called a tool, which ends the stream (see `JSProxyTool.call`). The host
-            // was handed each call through `jsToolCallback` and emits them at end-of-stream.
-        }
-
-        // Signal completion
-        if #available(macOS 27.0, *) {
-            emitUsage(readUsage(from: session), to: onChunk)
-        }
-        onChunk(nil)
-        return ""  // Not used in streaming mode
     }
+
+    // Sent before the first answer token so the host can attach them to the stream's
+    // `stream-start` warnings, which is the only place the AI SDK protocol carries warnings.
+    for warning in schemaWarnings {
+        sink.warn(warning)
+    }
+
+    var prev = ""
+    do {
+        for try await cumulative in makeTextStream(session: session, context: context) {
+            // Observe cancellation between chunks even if the framework's sequence is slow to.
+            try Task.checkCancellation()
+
+            let delta = streamDelta(previous: prev, current: cumulative.content)
+            prev = cumulative.content
+            guard !delta.isEmpty else { continue }
+            sink.send(delta)
+        }
+    } catch where isToolRoundComplete(error) {
+        // The model called a tool, which ends the stream.
+    }
+
+    let toolCalls = collector.all
+    if !toolCalls.isEmpty {
+        sink.send(TOOL_CALLS_SENTINEL, json: toolCalls)
+    }
+    if #available(macOS 27.0, *) {
+        sink.usage(readUsage(from: session))
+    }
+    sink.end()
+    return ""  // Not used in streaming mode
 }

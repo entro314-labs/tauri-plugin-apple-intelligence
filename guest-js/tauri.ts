@@ -99,7 +99,7 @@ export function createTauriAppleIntelligenceTransport(): AppleIntelligenceTransp
           onEvent: channel,
         });
       } catch (reason) {
-        // Same normalization as generate(): surface typed failures (stream-busy, host
+        // Same normalization as generate(): surface typed failures (invalid payloads, host
         // command-error envelopes) instead of the raw serialized rejection.
         throw toAppleIntelligenceError(reason);
       }
@@ -119,8 +119,7 @@ export function createTauriAppleIntelligenceTransport(): AppleIntelligenceTransp
       // Set once the terminal event has been handed to the consumer. A consumer that stops
       // iterating before then (a `break`, a thrown error, a cancelled ReadableStream downstream)
       // has abandoned the stream, and the generation is cancelled — otherwise it runs to
-      // completion holding the host's single stream slot, and the next stream fails with
-      // `stream-busy`.
+      // completion, spending inference on output nobody reads.
       let finished = false;
       try {
         while (true) {

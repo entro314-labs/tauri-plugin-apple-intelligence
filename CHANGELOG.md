@@ -6,6 +6,10 @@ together.
 
 ## [Unreleased]
 
+### Added
+
+- **Streams run concurrently.** Before, only one stream could run at a time, and a second stream was refused with `stream-busy` until the first finished. Each stream now gets its own routing and can be cancelled on its own.
+
 ### Fixed
 
 - **AI SDK image parts reach the model.** The provider still read file parts in the pre-V4 shape. The V4 spec wraps file data in a tagged union (`{ type: "data" | "url" | … }`) and allows a bare `image` media type, so no image matched: every image became an `[unsupported content - image/png]` line in the prompt, and `generateText`/`streamText` with images never sent an image to the model. File parts the model can't take, such as PDFs or remote URLs, still become a placeholder line, and now also produce an `unsupported` call warning.
@@ -13,10 +17,13 @@ together.
 - **A tool call now ends the generation, in both `generate` and `stream`.** Tools run on the host, so the model can't get their output mid-generation. Before, the bridge gave the model a placeholder output and let it continue, so it could make further tool calls with arguments it made up. For example, asked to look up the user's city and then that city's weather, it called `get_weather("New York")` without knowing the city, and the AI SDK ran that call. Now the calls from the first tool round are returned and the AI SDK's next step sends the real outputs. When the model calls several tools at once, all of those calls are still returned. Tool-calling requests also finish faster, because the model no longer generates text after a tool call.
 - **Rust-side streams no longer lose events.** `AppleIntelligence::stream` started generating before returning the app-event name that the caller then subscribed to. An event emitted before the subscription, such as an immediate `Error`, was lost, and the caller waited forever. `stream` now takes an `on_event` callback, installed before generation starts: `ai.stream(request, |event| ...)`. This is the same fix 0.12.0 made for webview streams. `AppleIntelligence` is no longer generic over the Tauri runtime.
 - The Tauri transport now cancels a stream that its consumer stops reading before the stream ends (a `break`, a thrown error, or a cancelled `ReadableStream` further down). Before, the generation kept running to completion and kept the plugin's single stream slot, so the next stream failed with `stream-busy`.
+- Streamed tool calls now use the same `call_…` id format as tool calls returned by `generate`. Before, streamed ids used a different `tool-call-…` format.
 - Tool calls from earlier turns reach the model with their arguments as structured objects. Before, each call's arguments were passed as a single JSON-encoded string (`"{\"city\":\"Athens\"}"`), not the object the model had generated.
 - **Unreadable images are refused, not dropped.** An image whose bytes don't decode, or whose `fileURL` doesn't point to a readable image, now fails with the new `invalid-image` code. Before, the image was left out of the prompt without any error, and the model described an image that didn't exist. On macOS 26, which has no image input, a request with images now fails with `unsupported-capability`. Before, the images were ignored without any error.
 
 ### Removed
+
+- `AppleAIError::StreamBusy`. Streams no longer block each other.
 
 - `AppleAIStreamStart::event_name` (Rust) and `eventName` (TS). Streams no longer emit app events.
 

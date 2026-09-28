@@ -13,10 +13,12 @@ pub(crate) use stub::*;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod macos {
     use super::*;
+    use serde::Serialize;
     use serde_json::json;
-    use std::ffi::{CStr, CString};
+    use std::collections::HashMap;
+    use std::ffi::{CStr, CString, c_char, c_void};
     use std::sync::{
-        Mutex, OnceLock,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, Ordering},
     };
 
@@ -41,11 +43,7 @@ mod macos {
         fn apple_ai_get_supported_languages_count() -> i32;
         fn apple_ai_get_supported_language(index: i32) -> *mut std::os::raw::c_char;
 
-        fn apple_ai_register_tool_callback(
-            cb: Option<extern "C" fn(u64, *const std::os::raw::c_char)>,
-        );
-
-        fn apple_ai_cancel_stream() -> bool;
+        fn apple_ai_cancel_stream(stream_id: *const c_char) -> bool;
 
         fn apple_ai_generate_unified(
             messages_json: *const std::os::raw::c_char,
@@ -54,60 +52,31 @@ mod macos {
             model: *const std::os::raw::c_char,
             reasoning_level: *const std::os::raw::c_char,
             options_json: *const std::os::raw::c_char,
-            stream: bool,
-            on_chunk: Option<extern "C" fn(*const std::os::raw::c_char)>,
+            stream_id: *const c_char,
+            stream_context: *mut c_void,
+            on_chunk: Option<extern "C" fn(*mut c_void, *const c_char)>,
         ) -> *mut std::os::raw::c_char;
     }
 
     static INIT: OnceLock<bool> = OnceLock::new();
-    static STREAM_ACTIVE: AtomicBool = AtomicBool::new(false);
-    /// Globally unique ids for tool definitions, so concurrent requests can never collide in
-    /// [`TOOL_NAME_MAP`] (the old per-request `1..n` numbering meant two in-flight requests
-    /// resolved each other's tool names).
-    static TOOL_ID_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-    static TOOL_NAME_MAP: OnceLock<Mutex<std::collections::HashMap<u64, String>>> = OnceLock::new();
-    static STREAM_STATE: OnceLock<Mutex<Option<StreamState>>> = OnceLock::new();
 
+    /// One live stream. Shared between [`STREAMS`] (so `cancel_stream` can find it) and the
+    /// native task, which holds a reference as its opaque context pointer and hands it back with
+    /// every chunk — that is how concurrent streams' chunks reach the right consumer.
     struct StreamState {
+        id: String,
         /// Where this stream's events go: the webview's invoke `Channel`, or the Rust caller's
         /// callback.
         emit: Box<dyn Fn(AppleAIStreamEvent) + Send + Sync>,
-        /// Id from [`AppleAIStreamStart`] — `cancel_stream` only acts on a matching id, so a
-        /// stale abort for an already-finished stream can never touch a newer one.
-        stream_id: String,
-        /// Set by `cancel_stream`. The chunk callback re-issues the native cancel on the next
-        /// chunk (closing the startup race where the Swift task wasn't registered yet) and stops
-        /// emitting text the consumer already abandoned.
-        cancel_requested: bool,
-        /// Ids of THIS stream's tool definitions. `tool_callback` buffers a call into
-        /// [`Self::tool_calls`] only when its id belongs here — a concurrent non-streaming
-        /// generate's tool calls return through its own JSON result, not this stream.
-        tool_ids: Vec<u64>,
-        /// Tool calls collected for this stream, emitted as `tool-call` events at end-of-stream.
-        tool_calls: Vec<(String, String, serde_json::Value)>,
+        /// Set by `cancel_stream`: text still in flight is dropped rather than delivered to a
+        /// consumer that already abandoned the stream.
+        cancelled: AtomicBool,
     }
 
-    /// Remove a finished request's tool ids from the shared name map.
-    fn release_tool_ids(ids: &[u64]) {
-        if ids.is_empty() {
-            return;
-        }
-        if let Some(map) = TOOL_NAME_MAP.get() {
-            let mut guard = map.lock().unwrap();
-            for id in ids {
-                guard.remove(id);
-            }
-        }
-    }
-
-    /// Releases its tool ids from [`TOOL_NAME_MAP`] on drop, so every exit path of a request
-    /// returns them. Defuse by `std::mem::take`-ing the ids out (e.g. to hand them to a
-    /// [`StreamState`], which then owns the cleanup).
-    struct ToolIdsGuard(Vec<u64>);
-    impl Drop for ToolIdsGuard {
-        fn drop(&mut self) {
-            release_tool_ids(&self.0);
-        }
+    /// Live streams by id. Each entry is removed by its stream's terminal chunk.
+    fn streams() -> &'static Mutex<HashMap<String, Arc<StreamState>>> {
+        static STREAMS: OnceLock<Mutex<HashMap<String, Arc<StreamState>>>> = OnceLock::new();
+        STREAMS.get_or_init(Mutex::default)
     }
 
     fn ensure_initialized() -> Result<(), AppleAIError> {
@@ -204,75 +173,87 @@ mod macos {
         }
     }
 
+    /// A request's arguments as the C strings `apple_ai_generate_unified` takes. The Swift side
+    /// copies them before it returns, so they only need to outlive the call.
+    struct NativeRequest {
+        messages: CString,
+        tools: Option<CString>,
+        schema: Option<CString>,
+        model: Option<CString>,
+        reasoning_level: Option<CString>,
+        options: CString,
+    }
+
+    impl NativeRequest {
+        fn new(request: &AppleAIGenerateRequest) -> Result<Self, AppleAIError> {
+            Ok(Self {
+                messages: json_cstring("Messages", &request.messages)?,
+                tools: request
+                    .tools
+                    .as_ref()
+                    .filter(|tools| !tools.is_empty())
+                    .map(|tools| json_cstring("Tools", tools))
+                    .transpose()?,
+                schema: request
+                    .schema
+                    .as_ref()
+                    .map(|schema| json_cstring("Schema", schema))
+                    .transpose()?,
+                model: optional_cstring(request.model.as_deref())?,
+                reasoning_level: optional_cstring(request.reasoning_level.as_deref())?,
+                options: serialize_options(request)?,
+            })
+        }
+
+        /// Call `apple_ai_generate_unified`: blocking, returning the JSON result, when `stream`
+        /// is `None`; otherwise registering a stream under the given id and returning null at
+        /// once, with every chunk delivered to [`stream_chunk_callback`] along with the context.
+        fn call(&self, stream: Option<(&CString, *mut c_void)>) -> *mut c_char {
+            let (stream_id, context, on_chunk) = match stream {
+                Some((id, context)) => (
+                    id.as_ptr(),
+                    context,
+                    Some(stream_chunk_callback as extern "C" fn(*mut c_void, *const c_char)),
+                ),
+                None => (std::ptr::null(), std::ptr::null_mut(), None),
+            };
+            let optional = |value: &Option<CString>| {
+                value
+                    .as_ref()
+                    .map_or(std::ptr::null(), |value| value.as_ptr())
+            };
+            // SAFETY: every pointer is a live NUL-terminated string (or null where the ABI takes
+            // an optional), and the Swift side copies them all before returning.
+            unsafe {
+                apple_ai_generate_unified(
+                    self.messages.as_ptr(),
+                    optional(&self.tools),
+                    optional(&self.schema),
+                    optional(&self.model),
+                    optional(&self.reasoning_level),
+                    self.options.as_ptr(),
+                    stream_id,
+                    context,
+                    on_chunk,
+                )
+            }
+        }
+    }
+
+    fn json_cstring(label: &str, value: &impl Serialize) -> Result<CString, AppleAIError> {
+        let json = serde_json::to_string(value).map_err(|e| AppleAIError::InvalidPayload {
+            message: format!("{label}: {e}"),
+        })?;
+        CString::new(json).map_err(|_| AppleAIError::InvalidPayload {
+            message: format!("{label} contained a null byte"),
+        })
+    }
+
     pub fn generate(
         request: AppleAIGenerateRequest,
     ) -> Result<AppleAIGenerateResult, AppleAIError> {
         ensure_initialized()?;
-
-        let messages_json =
-            serde_json::to_string(&request.messages).map_err(|e| AppleAIError::InvalidPayload {
-                message: e.to_string(),
-            })?;
-        let serialized_tools = serialize_tools(&request.tools)?;
-        let (tools_json, tool_ids) = match serialized_tools {
-            Some((json, ids)) => (Some(json), ids),
-            None => (None, Vec::new()),
-        };
-        // Released when this request returns, on every path.
-        let _tool_ids = ToolIdsGuard(tool_ids);
-        let schema_json = request
-            .schema
-            .as_ref()
-            .map(serde_json::to_string)
-            .transpose()
-            .map_err(|e| AppleAIError::InvalidPayload {
-                message: e.to_string(),
-            })?;
-
-        let c_messages = CString::new(messages_json).map_err(|_| AppleAIError::InvalidPayload {
-            message: "Messages contained null byte".into(),
-        })?;
-        let c_tools =
-            tools_json
-                .map(CString::new)
-                .transpose()
-                .map_err(|_| AppleAIError::InvalidPayload {
-                    message: "Tools contained null byte".into(),
-                })?;
-        let c_schema = schema_json.map(CString::new).transpose().map_err(|_| {
-            AppleAIError::InvalidPayload {
-                message: "Schema contained null byte".into(),
-            }
-        })?;
-        let c_model = optional_cstring(request.model.as_deref())?;
-        let c_reasoning = optional_cstring(request.reasoning_level.as_deref())?;
-        let c_options = serialize_options(&request)?;
-
-        if request.tools.as_ref().is_some_and(|t| !t.is_empty()) {
-            register_tool_callback();
-        }
-
-        let result_ptr = unsafe {
-            apple_ai_generate_unified(
-                c_messages.as_ptr(),
-                c_tools
-                    .as_ref()
-                    .map_or(std::ptr::null(), |value| value.as_ptr()),
-                c_schema
-                    .as_ref()
-                    .map_or(std::ptr::null(), |value| value.as_ptr()),
-                c_model
-                    .as_ref()
-                    .map_or(std::ptr::null(), |value| value.as_ptr()),
-                c_reasoning
-                    .as_ref()
-                    .map_or(std::ptr::null(), |value| value.as_ptr()),
-                c_options.as_ptr(),
-                false,
-                None,
-            )
-        };
-
+        let result_ptr = NativeRequest::new(&request)?.call(None);
         if result_ptr.is_null() {
             return Err(AppleAIError::NativeError {
                 message: "Generation returned null".into(),
@@ -316,146 +297,47 @@ mod macos {
     /// Start a streaming generation that delivers its events to `emit`. The emitter is installed
     /// before the native task starts, so no event — including an immediate terminal `error` — can
     /// be lost to a subscriber that registers late (the failure mode of the old named-event
-    /// transport, on both the webview and the Rust side).
+    /// transport, on both the webview and the Rust side). Streams run concurrently; each is
+    /// routed by its own context pointer.
     pub fn stream(
         emit: Box<dyn Fn(AppleAIStreamEvent) + Send + Sync>,
         request: AppleAIGenerateRequest,
     ) -> Result<AppleAIStreamStart, AppleAIError> {
+        ensure_initialized()?;
+        let native = NativeRequest::new(&request)?;
         let stream_id = uuid::Uuid::new_v4().to_string();
-        start_stream(emit, stream_id.clone(), request)?;
+        let c_stream_id =
+            CString::new(stream_id.clone()).map_err(|_| AppleAIError::InvalidPayload {
+                message: "Stream id contained a null byte".into(),
+            })?;
+
+        let state = Arc::new(StreamState {
+            id: stream_id.clone(),
+            emit,
+            cancelled: AtomicBool::new(false),
+        });
+        streams()
+            .lock()
+            .unwrap()
+            .insert(stream_id.clone(), Arc::clone(&state));
+        // The native task owns this reference until its terminal chunk (see `finish_stream`).
+        let context = Arc::into_raw(state) as *mut c_void;
+        native.call(Some((&c_stream_id, context)));
+
         Ok(AppleAIStreamStart { stream_id })
     }
 
-    fn start_stream(
-        emit: Box<dyn Fn(AppleAIStreamEvent) + Send + Sync>,
-        stream_id: String,
-        request: AppleAIGenerateRequest,
-    ) -> Result<(), AppleAIError> {
-        ensure_initialized()?;
-
-        if STREAM_ACTIVE.swap(true, Ordering::SeqCst) {
-            return Err(AppleAIError::StreamBusy {
-                message: "Another Apple Intelligence stream is already active".into(),
-            });
-        }
-
-        // The slot is reserved. If setup fails before the native task spawns, it must be released
-        // (and the half-built state cleared, its tool ids returned) — otherwise every later
-        // stream is refused with StreamBusy until the app restarts.
-        stream_with_slot(emit, stream_id, request).inspect_err(|_| {
-            let mut guard = STREAM_STATE
-                .get_or_init(|| Mutex::new(None))
-                .lock()
-                .unwrap();
-            if let Some(state) = guard.take() {
-                release_tool_ids(&state.tool_ids);
-            }
-            drop(guard);
-            STREAM_ACTIVE.store(false, Ordering::SeqCst);
-        })
-    }
-
-    /// The fallible part of [`start_stream`], run while the caller holds the single stream slot.
-    fn stream_with_slot(
-        emit: Box<dyn Fn(AppleAIStreamEvent) + Send + Sync>,
-        stream_id: String,
-        request: AppleAIGenerateRequest,
-    ) -> Result<(), AppleAIError> {
-        let messages_json =
-            serde_json::to_string(&request.messages).map_err(|e| AppleAIError::InvalidPayload {
-                message: e.to_string(),
-            })?;
-        // The registered ids are guarded until they are handed to the StreamState below, so a
-        // setup failure in between cannot leak them into TOOL_NAME_MAP.
-        let serialized_tools = serialize_tools(&request.tools)?;
-        let (tools_json, tool_ids) = match serialized_tools {
-            Some((json, ids)) => (Some(json), ids),
-            None => (None, Vec::new()),
-        };
-        let mut tool_ids = ToolIdsGuard(tool_ids);
-        let schema_json = request
-            .schema
-            .as_ref()
-            .map(serde_json::to_string)
-            .transpose()
-            .map_err(|e| AppleAIError::InvalidPayload {
-                message: e.to_string(),
-            })?;
-
-        let c_messages = CString::new(messages_json).map_err(|_| AppleAIError::InvalidPayload {
-            message: "Messages contained null byte".into(),
-        })?;
-        let c_tools =
-            tools_json
-                .map(CString::new)
-                .transpose()
-                .map_err(|_| AppleAIError::InvalidPayload {
-                    message: "Tools contained null byte".into(),
-                })?;
-        let c_schema = schema_json.map(CString::new).transpose().map_err(|_| {
-            AppleAIError::InvalidPayload {
-                message: "Schema contained null byte".into(),
-            }
-        })?;
-        let c_model = optional_cstring(request.model.as_deref())?;
-        let c_reasoning = optional_cstring(request.reasoning_level.as_deref())?;
-        let c_options = serialize_options(&request)?;
-
-        let state = StreamState {
-            emit,
-            stream_id,
-            cancel_requested: false,
-            tool_ids: std::mem::take(&mut tool_ids.0),
-            tool_calls: Vec::new(),
-        };
-        let state_mutex = STREAM_STATE.get_or_init(|| Mutex::new(None));
-        *state_mutex.lock().unwrap() = Some(state);
-
-        if request.tools.as_ref().is_some_and(|t| !t.is_empty()) {
-            register_tool_callback();
-        }
-
-        std::thread::spawn(move || unsafe {
-            apple_ai_generate_unified(
-                c_messages.as_ptr(),
-                c_tools
-                    .as_ref()
-                    .map_or(std::ptr::null(), |value| value.as_ptr()),
-                c_schema
-                    .as_ref()
-                    .map_or(std::ptr::null(), |value| value.as_ptr()),
-                c_model
-                    .as_ref()
-                    .map_or(std::ptr::null(), |value| value.as_ptr()),
-                c_reasoning
-                    .as_ref()
-                    .map_or(std::ptr::null(), |value| value.as_ptr()),
-                c_options.as_ptr(),
-                true,
-                Some(stream_chunk_callback),
-            );
-        });
-
-        Ok(())
-    }
-
     pub fn cancel_stream(stream_id: &str) -> Result<bool, AppleAIError> {
-        let state_mutex = STREAM_STATE.get_or_init(|| Mutex::new(None));
-        let mut guard = state_mutex.lock().unwrap();
-        let Some(state) = guard.as_mut() else {
+        let Some(state) = streams().lock().unwrap().get(stream_id).cloned() else {
             return Ok(false);
         };
-        if state.stream_id != stream_id {
-            return Ok(false);
-        }
-
-        state.cancel_requested = true;
-        // The Swift side cancels its in-flight task; the task's cancellation handler emits the
-        // terminal nil chunk, which flows through `stream_chunk_callback` to emit `done`, reset
-        // STREAM_ACTIVE and clear this state. If the task wasn't registered yet (startup race),
-        // the chunk callback above re-issues the cancel on the first chunk.
+        state.cancelled.store(true, Ordering::SeqCst);
+        let c_stream_id = CString::new(stream_id).map_err(|_| AppleAIError::InvalidPayload {
+            message: "Stream id contained a null byte".into(),
+        })?;
+        // The Swift task observes the cancellation and ends the stream with a clean `done`.
         unsafe {
-            apple_ai_cancel_stream();
+            apple_ai_cancel_stream(c_stream_id.as_ptr());
         }
         Ok(true)
     }
@@ -568,208 +450,95 @@ mod macos {
     /// Serialize a request's tools for the Swift bridge, registering each under a globally unique
     /// id in [`TOOL_NAME_MAP`]. Returns the JSON payload plus the allocated ids — the caller must
     /// hand the ids to [`release_tool_ids`] when the request finishes.
-    fn serialize_tools(
-        tools: &Option<Vec<AppleAIToolDefinition>>,
-    ) -> Result<Option<(String, Vec<u64>)>, AppleAIError> {
-        let Some(tools) = tools else {
-            return Ok(None);
-        };
-        if tools.is_empty() {
-            return Ok(None);
-        }
-
-        let ids: Vec<u64> = tools
-            .iter()
-            .map(|_| TOOL_ID_COUNTER.fetch_add(1, Ordering::Relaxed))
-            .collect();
-
-        let map = TOOL_NAME_MAP.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
-        {
-            let mut guard = map.lock().unwrap();
-            for (id, tool) in ids.iter().zip(tools) {
-                guard.insert(*id, tool.name.clone());
-            }
-        }
-
-        let payload: Vec<serde_json::Value> = tools
-            .iter()
-            .zip(&ids)
-            .map(|(tool, id)| {
-                json!({
-                    "id": id,
-                    "name": tool.name,
-                    "description": tool.description,
-                    "parameters": tool.parameters,
-                })
-            })
-            .collect();
-
-        match serde_json::to_string(&payload) {
-            Ok(json) => Ok(Some((json, ids))),
-            Err(e) => {
-                release_tool_ids(&ids);
-                Err(AppleAIError::InvalidPayload {
-                    message: e.to_string(),
-                })
-            }
-        }
-    }
-
-    fn register_tool_callback() {
-        unsafe { apple_ai_register_tool_callback(Some(tool_callback)) }
-    }
-
-    extern "C" fn tool_callback(tool_id: u64, args_json: *const std::os::raw::c_char) {
-        let args = unsafe {
-            if args_json.is_null() {
-                serde_json::Value::Object(serde_json::Map::new())
-            } else {
-                let raw = CStr::from_ptr(args_json).to_string_lossy().into_owned();
-                serde_json::from_str(&raw).unwrap_or_else(|_| json!({}))
-            }
-        };
-
-        let call_id = format!("tool-call-{}", uuid::Uuid::new_v4());
-        let tool_name = TOOL_NAME_MAP
-            .get()
-            .and_then(|map| {
-                map.lock()
-                    .ok()
-                    .and_then(|guard| guard.get(&tool_id).cloned())
-            })
-            .unwrap_or_else(|| format!("tool-{tool_id}"));
-
-        // Buffer the call for the stream that owns this tool id. A concurrent non-streaming
-        // generate's tool calls return through its own JSON result and must not leak onto an
-        // unrelated stream's event channel.
-        let state_mutex = STREAM_STATE.get_or_init(|| Mutex::new(None));
-        if let Some(state) = state_mutex.lock().unwrap().as_mut()
-            && state.tool_ids.contains(&tool_id)
-        {
-            state.tool_calls.push((call_id, tool_name, args));
-        }
-    }
-
-    // Streaming chunk channel tags — must match the Swift bridge's sentinel table. Untagged chunks
-    // are plain answer-text deltas.
+    // Streaming chunk tags — must match the Swift bridge's table. Untagged chunks are plain
+    // answer-text deltas; a null chunk is the clean end-of-stream.
     const ERROR_SENTINEL: u8 = 0x02;
     const REASONING_SENTINEL: u8 = 0x03;
     const USAGE_SENTINEL: u8 = 0x04;
     const WARNING_SENTINEL: u8 = 0x05;
+    const TOOL_CALLS_SENTINEL: u8 = 0x06;
 
-    extern "C" fn stream_chunk_callback(ptr: *const std::os::raw::c_char) {
-        // Copy and free the chunk before anything else, so the strdup'd buffer is released on
-        // every path — including chunks that arrive after the stream state was already cleared
-        // (e.g. text still in flight behind a terminal error).
-        let chunk = if ptr.is_null() {
-            None
-        } else {
-            Some(take_c_string(ptr as *mut std::os::raw::c_char))
-        };
-
-        let state_mutex = STREAM_STATE.get_or_init(|| Mutex::new(None));
-        let mut guard = state_mutex.lock().unwrap();
-        let Some(state) = guard.as_mut() else {
-            return;
-        };
-
-        let Some(slice) = chunk else {
-            emit_tool_calls(state);
-            emit_event(state, AppleAIStreamEvent::Done);
-            STREAM_ACTIVE.store(false, Ordering::SeqCst);
-            if let Some(finished) = guard.take() {
-                release_tool_ids(&finished.tool_ids);
-            }
-            return;
-        };
-        if slice.is_empty() {
+    extern "C" fn stream_chunk_callback(context: *mut c_void, chunk: *const c_char) {
+        // SAFETY: `context` is the `Arc<StreamState>` that `stream` handed to Swift. It stays
+        // alive until this stream's terminal chunk releases it in `finish_stream`, and the Swift
+        // task sends nothing after its terminal chunk.
+        let state = unsafe { &*(context as *const StreamState) };
+        if chunk.is_null() {
+            (state.emit)(AppleAIStreamEvent::Done);
+            finish_stream(context);
             return;
         }
+        // SAFETY: a non-null chunk is a NUL-terminated string, valid for this call.
+        let chunk = unsafe { CStr::from_ptr(chunk) }.to_bytes();
+        let payload = || String::from_utf8_lossy(&chunk[1..]).into_owned();
 
-        let bytes = slice.as_bytes();
-        match bytes.first() {
+        match chunk.first() {
             Some(&ERROR_SENTINEL) => {
-                // The payload is a typed JSON error object from the Swift bridge:
-                // {code, message, contextSize?, tokenCount?}.
-                let payload = String::from_utf8_lossy(&bytes[1..]).into_owned();
-                let event = match serde_json::from_str::<serde_json::Value>(&payload) {
-                    Ok(parsed) => AppleAIStreamEvent::Error {
-                        code: parsed
-                            .get("code")
-                            .and_then(|value| value.as_str())
-                            .unwrap_or("unknown")
-                            .to_string(),
-                        message: parsed
-                            .get("message")
-                            .and_then(|value| value.as_str())
-                            .unwrap_or(&payload)
-                            .to_string(),
-                        context_size: parsed.get("contextSize").and_then(|value| value.as_i64()),
-                        token_count: parsed.get("tokenCount").and_then(|value| value.as_i64()),
+                // A typed JSON error object from the Swift bridge: {code, message,
+                // contextSize?, tokenCount?}.
+                let event = match serde_json::from_slice::<serde_json::Value>(&chunk[1..]) {
+                    Ok(parsed) => match parse_bridge_error(&parsed) {
+                        AppleAIError::Generation {
+                            code,
+                            message,
+                            context_size,
+                            token_count,
+                        } => AppleAIStreamEvent::Error {
+                            code,
+                            message,
+                            context_size,
+                            token_count,
+                        },
+                        other => unreachable!("parse_bridge_error returns Generation: {other}"),
                     },
                     Err(_) => AppleAIStreamEvent::Error {
                         code: "unknown".to_string(),
-                        message: payload,
+                        message: payload(),
                         context_size: None,
                         token_count: None,
                     },
                 };
-                emit_event(state, event);
-                STREAM_ACTIVE.store(false, Ordering::SeqCst);
-                if let Some(finished) = guard.take() {
-                    release_tool_ids(&finished.tool_ids);
-                }
-                return;
+                (state.emit)(event);
+                finish_stream(context);
             }
             Some(&USAGE_SENTINEL) => {
-                if let Ok(usage) = serde_json::from_slice::<AppleAIUsage>(&bytes[1..]) {
-                    emit_event(state, AppleAIStreamEvent::Usage { usage });
+                if let Ok(usage) = serde_json::from_slice::<AppleAIUsage>(&chunk[1..]) {
+                    (state.emit)(AppleAIStreamEvent::Usage { usage });
                 }
-                return;
             }
             Some(&REASONING_SENTINEL) => {
-                let text = String::from_utf8_lossy(&bytes[1..]).into_owned();
-                emit_event(state, AppleAIStreamEvent::Reasoning { text });
-                return;
+                (state.emit)(AppleAIStreamEvent::Reasoning { text: payload() });
             }
             Some(&WARNING_SENTINEL) => {
-                // Non-fatal: the stream continues. Carries the properties a tool's schema declared
-                // that its guide could not express, ahead of the first answer token.
-                let message = String::from_utf8_lossy(&bytes[1..]).into_owned();
-                emit_event(state, AppleAIStreamEvent::Warning { message });
-                return;
+                // Non-fatal: the stream continues. Sent ahead of the first answer token.
+                (state.emit)(AppleAIStreamEvent::Warning { message: payload() });
             }
-            _ => {}
-        }
-
-        if state.cancel_requested {
-            // The consumer already aborted: drop the text and re-issue the native cancel — this
-            // closes the race where `cancel_stream` ran before the Swift task registered itself.
-            unsafe {
-                apple_ai_cancel_stream();
+            Some(&TOOL_CALLS_SENTINEL) => {
+                // The round's tool calls, in the non-streaming result's `toolCalls` shape.
+                let calls: Vec<AppleAIToolCall> =
+                    serde_json::from_slice(&chunk[1..]).unwrap_or_default();
+                for call in calls {
+                    (state.emit)(AppleAIStreamEvent::ToolCall {
+                        tool_call_id: call.id,
+                        tool_name: call.function.name,
+                        args: serde_json::from_str(&call.function.arguments)
+                            .unwrap_or_else(|_| json!({})),
+                    });
+                }
             }
-            return;
-        }
-
-        emit_event(state, AppleAIStreamEvent::Text { text: slice });
-    }
-
-    fn emit_tool_calls(state: &mut StreamState) {
-        let drained: Vec<_> = state.tool_calls.drain(..).collect();
-        for (id, name, args) in drained {
-            emit_event(
-                state,
-                AppleAIStreamEvent::ToolCall {
-                    tool_call_id: id,
-                    tool_name: name,
-                    args,
-                },
-            );
+            _ if chunk.is_empty() || state.cancelled.load(Ordering::SeqCst) => {}
+            _ => (state.emit)(AppleAIStreamEvent::Text {
+                text: String::from_utf8_lossy(chunk).into_owned(),
+            }),
         }
     }
 
-    fn emit_event(state: &StreamState, event: AppleAIStreamEvent) {
-        (state.emit)(event);
+    /// Release a finished stream: drop its registry entry and the native task's reference.
+    fn finish_stream(context: *mut c_void) {
+        // SAFETY: reclaims the reference `stream` leaked with `Arc::into_raw`, exactly once — only
+        // the terminal chunk calls this.
+        let state = unsafe { Arc::from_raw(context as *const StreamState) };
+        streams().lock().unwrap().remove(&state.id);
     }
 }
 
