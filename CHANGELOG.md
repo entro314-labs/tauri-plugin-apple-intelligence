@@ -6,6 +6,13 @@ together.
 
 ## [Unreleased]
 
+## [0.13.1] - 2026-10-01
+
+### Changed
+
+- The minimum supported Rust version is now 1.99.0. ([2d5afe5](https://github.com/entro314-labs/tauri-plugin-apple-intelligence/commit/2d5afe5))
+- The prebuilt Swift library (`libappleai.dylib`) and its module files were rebuilt. No Swift source changed since 0.13.0, so it is unclear what changes for apps that link the prebuilt library. ([2d5afe5](https://github.com/entro314-labs/tauri-plugin-apple-intelligence/commit/2d5afe5))
+
 ## [0.13.0] - 2026-09-28
 
 ### Added
@@ -98,7 +105,8 @@ together.
   an explicit `maxTokens` for genuinely larger objects.
 - npm: removed the `ai` peer dependency — the provider only depends on `@ai-sdk/provider`.
 
-[Unreleased]: https://github.com/entro314-labs/tauri-plugin-apple-intelligence/compare/v0.13.0...HEAD
+[Unreleased]: https://github.com/entro314-labs/tauri-plugin-apple-intelligence/compare/v0.13.1...HEAD
+[0.13.1]: https://github.com/entro314-labs/tauri-plugin-apple-intelligence/compare/v0.13.0...v0.13.1
 [0.13.0]: https://github.com/entro314-labs/tauri-plugin-apple-intelligence/compare/v0.12.2...v0.13.0
 [0.12.2]: https://github.com/entro314-labs/tauri-plugin-apple-intelligence/compare/v0.12.1...v0.12.2
 [0.12.1]: https://github.com/entro314-labs/tauri-plugin-apple-intelligence/compare/v0.12.0...v0.12.1
