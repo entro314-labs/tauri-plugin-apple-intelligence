@@ -6,6 +6,12 @@ together.
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-11-03
+
+### Changed
+
+- The minimum supported Rust version is now 1.99.1. ([3df1552](https://github.com/entro314-labs/tauri-plugin-apple-intelligence/commit/3df1552))
+
 ## [0.13.2] - 2026-10-01
 
 ### Changed
@@ -111,10 +117,11 @@ together.
   an explicit `maxTokens` for genuinely larger objects.
 - npm: removed the `ai` peer dependency — the provider only depends on `@ai-sdk/provider`.
 
-[Unreleased]: https://github.com/entro314-labs/tauri-plugin-apple-intelligence/compare/v0.13.2...HEAD
-[0.13.2]: https://github.com/entro314-labs/tauri-plugin-apple-intelligence/compare/v0.13.1...v0.13.2
-[0.13.1]: https://github.com/entro314-labs/tauri-plugin-apple-intelligence/compare/v0.13.0...v0.13.1
-[0.13.0]: https://github.com/entro314-labs/tauri-plugin-apple-intelligence/compare/v0.12.2...v0.13.0
-[0.12.2]: https://github.com/entro314-labs/tauri-plugin-apple-intelligence/compare/v0.12.1...v0.12.2
-[0.12.1]: https://github.com/entro314-labs/tauri-plugin-apple-intelligence/compare/v0.12.0...v0.12.1
-[0.12.0]: https://github.com/entro314-labs/tauri-plugin-apple-intelligence/releases/tag/v0.12.0
+[Unreleased]: https://github.com/entro314-labs/tauri-plugin-apple-intelligence/compare/@entro314labs/plugin-apple-intelligence@0.14.0...HEAD
+[0.14.0]: https://github.com/entro314-labs/tauri-plugin-apple-intelligence/compare/@entro314labs/plugin-apple-intelligence@0.13.2...@entro314labs/plugin-apple-intelligence@0.14.0
+[0.13.2]: https://github.com/entro314-labs/tauri-plugin-apple-intelligence/compare/@entro314labs/plugin-apple-intelligence@0.13.1...@entro314labs/plugin-apple-intelligence@0.13.2
+[0.13.1]: https://github.com/entro314-labs/tauri-plugin-apple-intelligence/compare/@entro314labs/plugin-apple-intelligence@0.13.0...@entro314labs/plugin-apple-intelligence@0.13.1
+[0.13.0]: https://github.com/entro314-labs/tauri-plugin-apple-intelligence/compare/@entro314labs/plugin-apple-intelligence@0.12.2...@entro314labs/plugin-apple-intelligence@0.13.0
+[0.12.2]: https://github.com/entro314-labs/tauri-plugin-apple-intelligence/compare/@entro314labs/plugin-apple-intelligence@0.12.1...@entro314labs/plugin-apple-intelligence@0.12.2
+[0.12.1]: https://github.com/entro314-labs/tauri-plugin-apple-intelligence/compare/@entro314labs/plugin-apple-intelligence@0.12.0...@entro314labs/plugin-apple-intelligence@0.12.1
+[0.12.0]: https://github.com/entro314-labs/tauri-plugin-apple-intelligence/releases/tag/@entro314labs/plugin-apple-intelligence@0.12.0
